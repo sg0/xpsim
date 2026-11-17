@@ -1,0 +1,26 @@
+{
+  "label": "example-8w",
+  "workers": 8, "nodes": 2,
+  "config": {"tp": 2, "pp": 2, "dp": 2, "fsdp": 1, "cp": 1, "ep": 2, "zero": 0, "sp": 1, "overlap": 1, "recompute": 0, "precision": "bf16", "device": "cpu", "transport": "hier", "router": "local", "layers": 4, "hidden": 256, "seq": 128, "experts": 8, "global_batch": 16},
+  "fom": {"iter_time_s": 2.45806, "iter_time_std_s": 0.0978562, "tokens_per_s": 833.179, "tflops_per_worker": 0.00377274, "mfu": 0.189421, "hfu": 0.189421, "peak_tflops": 0.0199173, "comm_fraction": 0.357878, "compute_imbalance": 1.04249, "peak_mem_bytes": 9.37595e+07},
+  "categories": {
+    "gemm_fwd": {"mean_s": 0.408597, "max_s": 0.463562, "calls": 90, "bytes": 0, "busbytes": 0, "intra_bytes": 0, "inter_bytes": 0},
+    "gemm_bwd": {"mean_s": 0.769847, "max_s": 0.803208, "calls": 180, "bytes": 0, "busbytes": 0, "intra_bytes": 0, "inter_bytes": 0},
+    "attn_fwd": {"mean_s": 0.0137602, "max_s": 0.0203084, "calls": 8, "bytes": 0, "busbytes": 0, "intra_bytes": 0, "inter_bytes": 0},
+    "attn_bwd": {"mean_s": 0.0212469, "max_s": 0.036404, "calls": 8, "bytes": 0, "busbytes": 0, "intra_bytes": 0, "inter_bytes": 0},
+    "elementwise": {"mean_s": 0.231984, "max_s": 0.252284, "calls": 114, "bytes": 0, "busbytes": 0, "intra_bytes": 0, "inter_bytes": 0},
+    "moe_route": {"mean_s": 0.0335315, "max_s": 0.0463015, "calls": 160, "bytes": 0, "busbytes": 0, "intra_bytes": 0, "inter_bytes": 0},
+    "optimizer": {"mean_s": 0.0823718, "max_s": 0.0876778, "calls": 5, "bytes": 0, "busbytes": 0, "intra_bytes": 0, "inter_bytes": 0},
+    "tp_allreduce": {"mean_s": 0.0358736, "max_s": 0.044986, "calls": 8, "bytes": 65536, "busbytes": 65536, "intra_bytes": 65536, "inter_bytes": 0},
+    "tp_allgather": {"mean_s": 0.0797117, "max_s": 0.108598, "calls": 20, "bytes": 2.62144e+06, "busbytes": 1.31072e+06, "intra_bytes": 1.31072e+06, "inter_bytes": 0},
+    "tp_reducescatter": {"mean_s": 0.0972039, "max_s": 0.109107, "calls": 20, "bytes": 2.62144e+06, "busbytes": 1.31072e+06, "intra_bytes": 1.31072e+06, "inter_bytes": 0},
+    "dp_allreduce": {"mean_s": 0.011259, "max_s": 0.0233251, "calls": 3, "bytes": 2.11354e+06, "busbytes": 2.11354e+06, "intra_bytes": 2.11354e+06, "inter_bytes": 0},
+    "expert_allreduce": {"mean_s": 0.00993189, "max_s": 0.0231413, "calls": 2, "bytes": 1.67772e+07, "busbytes": 1.67772e+07, "intra_bytes": 1.67772e+07, "inter_bytes": 0},
+    "ep_alltoall": {"mean_s": 0.229434, "max_s": 0.257007, "calls": 40, "bytes": 4.19482e+06, "busbytes": 2.09715e+06, "intra_bytes": 2.09715e+06, "inter_bytes": 0},
+    "pp_p2p": {"mean_s": 0.286798, "max_s": 0.471536, "calls": 8, "bytes": 262144, "busbytes": 262144, "intra_bytes": 0, "inter_bytes": 262144},
+    "loss_allreduce": {"mean_s": 0.0165033, "max_s": 0.0413213, "calls": 4, "bytes": 12288, "busbytes": 8192, "intra_bytes": 8192, "inter_bytes": 0},
+    "gradnorm_allreduce": {"mean_s": 0.107427, "max_s": 0.215751, "calls": 1, "bytes": 8, "busbytes": 14, "intra_bytes": 6, "inter_bytes": 8},
+    "misc_comm": {"mean_s": 0.00554095, "max_s": 0.0107828, "calls": 0.666667, "bytes": 0, "busbytes": 0, "intra_bytes": 0, "inter_bytes": 0}
+  },
+  "iter_times_s": [2.42068, 2.56909, 2.3844]
+}

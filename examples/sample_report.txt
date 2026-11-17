@@ -1,0 +1,73 @@
+xpsim: 8 workers, 2 node(s), transport hier
+model: L=4 h=256 heads=4 kv=4 ffn=1024 seq=128 vocab=2048 experts=8 top2 every=1 eff=1024 cf=0
+batch: micro=2 x 4 microbatches x dp 2 = 16 seqs (2048 tokens/iter)
+parallel: tp=2+sp pp=2(1f1b) dp=2 fsdp=1 cp=1 ep=2 zero=0 overlap
+router: local (alpha=1 locality=0.7/node beta=1 max-nodes=1 topo=flat)
+device: cpu precision=bf16 grads=fp32 master=fp32 transport=hier
+
+================================ xpsim report ================================
+label: example-8w
+model: L=4 h=256 heads=4 kv=4 ffn=1024 seq=128 vocab=2048 experts=8 top2 every=1 eff=1024 cf=0
+batch: micro=2 x 4 microbatches x dp 2 = 16 seqs (2048 tokens/iter)
+parallel: tp=2+sp pp=2(1f1b) dp=2 fsdp=1 cp=1 ep=2 zero=0 overlap
+router: local (alpha=1 locality=0.7/node beta=1 max-nodes=1 topo=flat)
+device: cpu precision=bf16 grads=fp32 master=fp32 transport=hier
+workers: 8 (2 node(s) x 4)  device: cpu  GEMM: built-in blocked GEMM (no CBLAS)
+groups (worker 0):
+  tp   size=2 nodes=1 members=[0,1]
+  cp   size=1 nodes=1 members=[0]
+  fsdp size=1 nodes=1 members=[0]
+  hsdp size=2 nodes=1 members=[0,2]
+  dp   size=2 nodes=1 members=[0,2]
+  pp   size=2 nodes=2 members=[0,4]
+  ep   size=2 nodes=1 members=[0,2]
+  edp  size=2 nodes=1 members=[0,1]
+model: 18.9 M params (2.11 M dense, 16.8 M expert), 5.78 M active/token; 36.2 MFLOP/token (6N + attention)
+
+---- figures of merit ---------------------------------------------------------
+iteration time      : 2.4581 s  (std 0.0979, min 2.3844, max 2.5691, 3 iters, max over workers)
+throughput          : 833 tokens/s  |  6.51 samples/s  |  104 tokens/s/worker
+model FLOPs / iter  : counted 74.2 GFLOP  analytic 74.2 GFLOP  (ratio 1.000)
+achieved per worker : 0.004 TFLOP/s model, 0.004 TFLOP/s hardware (incl. recompute)
+peak per worker     : 0.020 TFLOP/s (measured GEMM)
+MFU / HFU           : 18.94 % / 18.94 %
+compute / comm / other (mean per worker): 1561.3 / 879.7 / 10.2 ms   comm fraction 35.8 %
+compute imbalance   : max/mean 1.042
+
+---- time breakdown per iteration ---------------------------------------------
+category                 mean ms    max ms  %iter  calls    MB/iter  algBW GB/s busBW GB/s  intra MB  inter MB
+gemm_fwd                  408.60    463.56   16.6     90                                                      
+gemm_bwd                  769.85    803.21   31.3    180                                                      
+attn_fwd                   13.76     20.31    0.6      8                                                      
+attn_bwd                   21.25     36.40    0.9      8                                                      
+elementwise               231.98    252.28    9.4    114                                                      
+moe_route                  33.53     46.30    1.4    160                                                      
+optimizer                  82.37     87.68    3.4      5                                                      
+tp_allreduce               35.87     44.99    1.5      8        0.1        0.00       0.00       0.1       0.0
+tp_allgather               79.71    108.60    3.2     20        2.5        0.03       0.02       1.2       0.0
+tp_reducescatter           97.20    109.11    4.0     20        2.5        0.03       0.01       1.2       0.0
+dp_allreduce               11.26     23.33    0.5      3        2.0        0.19       0.19       2.0       0.0
+expert_allreduce            9.93     23.14    0.4      2       16.0        1.69       1.69      16.0       0.0
+ep_alltoall               229.43    257.01    9.3     40        4.0        0.02       0.01       2.0       0.0
+pp_p2p                    286.80    471.54   11.7      8        0.2        0.00       0.00       0.0       0.2
+loss_allreduce             16.50     41.32    0.7      4        0.0        0.00       0.00       0.0       0.0
+gradnorm_allreduce        107.43    215.75    4.4      1        0.0        0.00       0.00       0.0       0.0
+misc_comm                   5.54     10.78    0.2      1        0.0        0.00       0.00       0.0       0.0
+(comm times are exposed wall time on the worker incl. waiting for peers; with --overlap they exclude hidden
+ transfer time. --sync-collectives separates skew (sync_wait) from transfer time.)
+comm volume / worker / iter: 27.3 MiB  (intra-node 22.6 MiB, inter-node 0.3 MiB)
+
+---- pipeline ------------------------------------------------------------------
+theoretical bubble (p-1)/(m+p-1): 20.0 %
+  stage 0: p2p+bubble wait 466.51 ms (19.0 %), compute 1518.38 ms
+  stage 1: p2p+bubble wait 107.09 ms (4.4 %), compute 1604.29 ms
+
+---- MoE / expert parallelism -------------------------------------------------
+router: local  assignments/iter 16.4 K  dropped 0.00 %
+destination: self 50.0 %, intra-node 50.0 %, inter-node 0.0 %   mean hops 0.000   distinct nodes/token 1.00
+expert load imbalance (max over workers of max/mean tokens per local expert): 1.135
+all-to-all: 4.0 MiB/iter/worker (self 2.0, intra 2.0, inter 0.0), 229.43 ms
+
+---- memory (peak per worker, max over workers) -------------------------------
+total 89.4 MiB : params 9.0 grads 18.0 optimizer 54.0 activations 8.3 comm_buffers 0.2 workspace 0.0
+===============================================================================
