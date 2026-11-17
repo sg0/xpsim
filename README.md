@@ -135,6 +135,8 @@ user-defined MPI ops are host-only: prefer `--grad-dtype fp32` (default) or `hie
 ---------------------------------------------------------------------------------
 ## 4. Code map (Elemental-style matrices)
 
+Check: Poulson, Jack, et al. "Elemental: A new framework for distributed memory dense matrix computations." ACM Transactions on Mathematical Software (TOMS) 39.2 (2013): 1-24.
+
 | file | content |
 |---|---|
 | `include/xpsim/matrix.hpp` | `Matrix<T>`: El::Matrix analogue (column-major, `Height/Width/LDim/Buffer/Attach/View`), `Gemm`, `Axpy`, `Copy` |
