@@ -3,7 +3,7 @@
 #   make                         CPU build with $(MPICXX) (MPI required)
 #   make CUDA=1 SM=90            + CUDA backend (cuBLAS tensor cores, sm_80+) and
 #                                  VMM/CUDA-aware-MPI hierarchical transport
-#   make BLAS=openblas|mkl|blis  vendor CBLAS for CPU GEMMs (or BLAS_LIBS=...)
+#   make BLAS=openblas|mkl|blis|libsci  vendor CBLAS for CPU GEMMs (or BLAS_LIBS=...)
 #   make SHIM=1                  no MPI installed: thread-based MPI shim (testing)
 #   make test                    quick functional tests (uses the shim build)
 #
@@ -54,9 +54,13 @@ ifneq ($(BLAS_LIBS),)
   CXXFLAGS += -DXPSIM_CBLAS
   LDLIBS   += $(BLAS_LIBS)
 endif
+# Cray LibSci (HPE/Cray PE, e.g. Perlmutter): the CC wrapper links it already
+ifeq ($(BLAS),libsci)
+  CXXFLAGS += -DXPSIM_CBLAS
+endif
 
 SRCS := src/main.cpp src/config.cpp src/device.cpp src/device_cpu.cpp src/metrics.cpp src/comm.cpp \
-        src/comm_hier.cpp src/grid.cpp src/moe_router.cpp src/trainer.cpp src/report.cpp src/selftest.cpp
+        src/comm_hier.cpp src/grid.cpp src/moe_router.cpp src/trainer.cpp src/report.cpp src/selftest.cpp src/trace.cpp
 ifeq ($(SHIM),1)
   SRCS += tools/mpishim/mpishim.cpp
 endif

@@ -20,6 +20,9 @@
 #   fsdp_strong  fsdp at a fixed global batch (strong scaling)
 #   moe_ep    MoE model, --dp W --ep gcd(W, experts)
 #   moe_router   MoE at the largest n with each router locality policy
+#
+# XP_REPLAY="off graph" additionally runs every case with in-process trace replay
+# (GPU: one CUDA graph per compute segment) -> labels "<transport>+graph".
 
 xp_default_nodes() {
   local n=1 out=""; local max=${SLURM_NNODES:-1}
@@ -32,11 +35,12 @@ xp_scaling() {
   local nodes_list=${XP_NODES:-$(xp_default_nodes)}
   local strategies=${XP_STRATEGIES:-"dp fsdp zero1 hsdp tp_dp tp_pp_dp cp_dp fsdp_strong moe_ep moe_router"}
   local transports=${XP_TRANSPORTS:-"mpi hier"}
+  local replays=${XP_REPLAY:-off}
   local csv="$XP_OUT/scaling_${XP_PART}.csv"
   local peak; peak=$(xp_peak_args "$XP_PREC")
   local base="$XP_MODEL --precision $XP_PREC $peak --csv $csv"
   local nmax=0; for n in $nodes_list; do [ "$n" -gt "$nmax" ] && nmax=$n; done
-  echo "nodes: $nodes_list | strategies: $strategies | transports: $transports | workers/node: $G"
+  echo "nodes: $nodes_list | strategies: $strategies | transports: $transports | replay: $replays | workers/node: $G"
   echo "model: $XP_MODEL --precision $XP_PREC | MoE: $XP_MOE_MODEL | csv: $csv"
   for n in $nodes_list; do
     local W=$((n * G))
@@ -68,14 +72,17 @@ xp_scaling() {
           [ "$r" = local ] || [ "$r" = remote ] && rargs="$rargs --locality 0.9"
         fi
         for tr in $transports; do
-          local label="$sname|$tr|$n|$W|$mode"
-          local json="$XP_OUT/json/$(echo "$label" | tr '|' '_').json"
-          mkdir -p "$XP_OUT/json"
-          if [ "$tr" = mpi ]; then
-            xp_case "$label" "$n" "$G" mpi 1 -- $base $args $rargs --label "$label" --json "$json"
-          else
-            xp_case "$label" "$n" 1 hier "$G" -- $base $args $rargs --label "$label" --json "$json"
-          fi
+          for rp in $replays; do
+            local tl=$tr; [ "$rp" != off ] && tl="$tr+$rp"
+            local label="$sname|$tl|$n|$W|$mode"
+            local json="$XP_OUT/json/$(echo "$label" | tr '|+' '__').json"
+            mkdir -p "$XP_OUT/json"
+            if [ "$tr" = mpi ]; then
+              xp_case "$label" "$n" "$G" mpi 1 -- $base $args $rargs --replay "$rp" --label "$label" --json "$json"
+            else
+              xp_case "$label" "$n" 1 hier "$G" -- $base $args $rargs --replay "$rp" --label "$label" --json "$json"
+            fi
+          done
         done
       done
     done

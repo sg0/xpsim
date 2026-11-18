@@ -359,3 +359,49 @@ void xfer_reduce(int, void* dv, const void* const* srcs, int k, size_t n, DType 
 void xfer_sync(int) {}
 
 }  // namespace xpsim::dev::cpu
+
+// ---------------------------------------------------------------- device-resident variants
+#include <sys/mman.h>
+namespace xpsim::dev::cpu {
+void copy_rows_d(const void* src, Int lds, bool srm, const int* srow, void* dst, Int ldd, bool drm, const int* drow,
+                 Int n, Int width, const float* w, bool acc, DType dt) {
+  copy_rows(src, lds, srm, srow, dst, ldd, drm, drow, n, width, w, acc, dt);  // host == device
+}
+void col_max_d(const void* L, Int r, Int c, Int ld, DType dt, float* o) { col_max(L, r, c, ld, dt, o); }
+void col_sumexp_d(const void* L, Int r, Int c, Int ld, DType dt, const float* mx, float* o) { col_sumexp(L, r, c, ld, dt, mx, o); }
+void xent_grad_d(void* L, Int r, Int c, Int ld, DType dt, const float* mx, const float* sm, const int* t, float sc) {
+  xent_grad(L, r, c, ld, dt, mx, sm, t, sc);
+}
+void max_blocks(float* d, const float* s, int p, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    float m = s[i];
+    for (int j = 1; j < p; ++j) m = std::max(m, s[size_t(j) * n + i]);
+    d[i] = m;
+  }
+}
+void sumsq_acc(const void* x, size_t n, DType dt, double* acc, double w) { *acc += w * sumsq(x, n, dt); }
+void opt_update(OptState* st, float ls, float clip) {
+  const double norm = std::sqrt(st->norm2) / ls;
+  st->norm = float(norm);
+  st->skip = std::isfinite(norm) ? 0 : 1;
+  double gs = 1.0 / ls;
+  if (clip > 0 && std::isfinite(norm) && norm > clip) gs *= clip / (norm + 1e-6);
+  st->gscale = float(gs);
+  if (st->skip) ++st->skipped_total; else ++st->step;
+}
+void adamw_d(void* p, DType dtp, const void* g, DType dtg, void* m, void* v, size_t n, float lr, float b1, float b2,
+             float eps, float wd, const OptState* st) {
+  if (st->skip) return;
+  adamw(p, dtp, g, dtg, m, v, n, lr, b1, b2, eps, wd, st->step, st->gscale);
+}
+void graph_begin() { fail("CUDA graphs need the GPU backend"); }
+void* graph_end(const char*) { fail("CUDA graphs need the GPU backend"); }
+void graph_launch(void*) { fail("CUDA graphs need the GPU backend"); }
+void graph_destroy(void*) {}
+size_t free_memory() { return size_t(64) << 30; }  // virtual reservation; pages are committed on touch
+void* arena_reserve(size_t bytes) {
+  void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  return p == MAP_FAILED ? nullptr : p;
+}
+void arena_release(void* p, size_t bytes) { munmap(p, bytes); }
+}  // namespace xpsim::dev::cpu

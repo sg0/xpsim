@@ -123,6 +123,19 @@ void report(const Config& cfg, const ProcessGrid& g, double peak, const ModelCou
   o << "MFU / HFU           : " << fmt("%.2f", 100 * mfu) << " % / " << fmt("%.2f", 100 * hfu) << " %\n";
   o << "compute / comm / other (mean per worker): " << fmt("%.1f", 1e3 * comp_mean) << " / " << fmt("%.1f", 1e3 * comm_mean)
     << " / " << fmt("%.1f", 1e3 * other_mean) << " ms   comm fraction " << fmt("%.1f", 100 * comm_mean / t_mean) << " %\n";
+  {
+    const auto& ri = m.replay;
+    o << "execution           : ";
+    if (ri.mode == "live") o << "live (no replay)\n";
+    else {
+      o << "replay " << ri.mode << " from " << ri.source;
+      if (ri.trace_iter >= 0) o << " (recorded warm-up iteration " << int(ri.trace_iter) << ")";
+      o << "\n                      " << int(ri.ops) << " recorded ops/step, " << int(ri.compute_segments) << " compute + "
+        << int(ri.segments - ri.compute_segments) << " communication segments";
+      if (ri.graphs > 0) o << ", " << int(ri.graphs) << " CUDA graphs";
+      o << ", build " << fmt("%.3f", ri.build_s) << " s (worker 0)\n";
+    }
+  }
   o << "compute imbalance   : max/mean " << fmt("%.3f", comp_mean > 0 ? comp_max / comp_mean : 1) << "\n";
   double skipped = 0; for (int w = 0; w < W; ++w) skipped = std::max(skipped, at(w, OFF_SKIP));
   if (skipped > 0) o << "skipped steps       : " << skipped << " (fp16 overflow)\n";
@@ -203,7 +216,10 @@ void report(const Config& cfg, const ProcessGrid& g, double peak, const ModelCou
     j << "  \"fom\": {\"iter_time_s\": " << t_mean << ", \"iter_time_std_s\": " << t_std << ", \"tokens_per_s\": " << tokens / t_mean
       << ", \"tflops_per_worker\": " << fm / t_mean / W / 1e12 << ", \"mfu\": " << mfu << ", \"hfu\": " << hfu
       << ", \"peak_tflops\": " << peak << ", \"comm_fraction\": " << comm_mean / t_mean << ", \"compute_imbalance\": "
-      << (comp_mean > 0 ? comp_max / comp_mean : 1) << ", \"peak_mem_bytes\": " << mpk << "},\n  \"categories\": {";
+      << (comp_mean > 0 ? comp_max / comp_mean : 1) << ", \"peak_mem_bytes\": " << mpk << "},\n";
+    j << "  \"execution\": {\"mode\": \"" << m.replay.mode << "\", \"source\": \"" << m.replay.source << "\", \"ops\": "
+      << m.replay.ops << ", \"segments\": " << m.replay.segments << ", \"compute_segments\": " << m.replay.compute_segments
+      << ", \"graphs\": " << m.replay.graphs << ", \"build_s\": " << m.replay.build_s << "},\n  \"categories\": {";
     bool first = true;
     for (int c = 0; c < NCAT; ++c) {
       const Row& r = rows[c];

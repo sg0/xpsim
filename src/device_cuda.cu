@@ -24,6 +24,8 @@ struct Worker {
   cublasHandle_t blas = nullptr;
   void* iscratch = nullptr; size_t iscratch_bytes = 0;  // uploaded index/weight arrays
   float* fscratch = nullptr; size_t fscratch_n = 0;
+  void* blas_ws = nullptr;  // fixed cuBLAS workspace: required for stream capture
+  bool capturing = false;
 };
 thread_local Worker W;
 
@@ -239,9 +241,13 @@ void init(int device) {
   CUDA_OK(cudaStreamCreateWithFlags(&W.stream, cudaStreamNonBlocking));
   CUBLAS_OK(cublasCreate(&W.blas));
   CUBLAS_OK(cublasSetStream(W.blas, W.stream));
+  const size_t ws = size_t(32) << 20;
+  CUDA_OK(cudaMalloc(&W.blas_ws, ws));
+  CUBLAS_OK(cublasSetWorkspace(W.blas, W.blas_ws, ws));
 }
 void finalize() {
   if (W.blas) cublasDestroy(W.blas);
+  if (W.blas_ws) cudaFree(W.blas_ws);
   if (W.iscratch) cudaFree(W.iscratch);
   if (W.fscratch) cudaFree(W.fscratch);
   if (W.stream) cudaStreamDestroy(W.stream);
@@ -391,6 +397,61 @@ void xent_grad(void* L, Int rows, Int cols, Int ld, DType dt, const float* mx, c
   with_type(dt, [&](auto t) { using TT = decltype(t); k_xent<TT><<<unsigned(cols), 256, 0, W.stream>>>(static_cast<TT*>(L), rows, ld, d, d + cols, it, sc); });
   CUDA_OK(cudaStreamSynchronize(W.stream));
 }
+
+// ---------------- device-resident variants (no host sync: graph-capturable) ----------------
+void copy_rows_d(const void* src, Int lds, bool srm, const int* srow, void* dst, Int ldd, bool drm, const int* drow,
+                 Int n, Int width, const float* w, bool acc, DType dt) {
+  with_type(dt, [&](auto t) { using TT = decltype(t);
+    if (acc) k_copy_rows_acc<TT><<<blocks(width), 256, 0, W.stream>>>(static_cast<const TT*>(src), lds, srm, srow, static_cast<TT*>(dst), ldd, drm, drow, n, width, w);
+    else k_copy_rows<TT><<<blocks(size_t(n) * width), 256, 0, W.stream>>>(static_cast<const TT*>(src), lds, srm, srow, static_cast<TT*>(dst), ldd, drm, drow, n, width, w);
+  });
+}
+void col_max_d(const void* L, Int rows, Int cols, Int ld, DType dt, float* out) {
+  with_type(dt, [&](auto t) { using TT = decltype(t); k_colstat<TT><<<unsigned(cols), 256, 0, W.stream>>>(static_cast<const TT*>(L), rows, ld, nullptr, out); });
+}
+void col_sumexp_d(const void* L, Int rows, Int cols, Int ld, DType dt, const float* mx, float* out) {
+  with_type(dt, [&](auto t) { using TT = decltype(t); k_colstat<TT><<<unsigned(cols), 256, 0, W.stream>>>(static_cast<const TT*>(L), rows, ld, mx, out); });
+}
+void xent_grad_d(void* L, Int rows, Int cols, Int ld, DType dt, const float* mx, const float* sm, const int* tgt, float sc) {
+  with_type(dt, [&](auto t) { using TT = decltype(t); k_xent<TT><<<unsigned(cols), 256, 0, W.stream>>>(static_cast<TT*>(L), rows, ld, mx, sm, tgt, sc); });
+}
+void max_blocks(float* d, const float* s, int p, size_t n) { k_max_blocks<<<blocks(n), 256, 0, W.stream>>>(d, s, p, n); }
+void sumsq_acc(const void* x, size_t n, DType dt, double* acc, double w) {
+  with_type(dt, [&](auto t) { using TT = decltype(t); k_sumsq_w<TT><<<blocks(n), 256, 0, W.stream>>>(static_cast<const TT*>(x), n, acc, w); });
+}
+void opt_update(OptState* st, float ls, float clip) { k_opt_update<<<1, 32, 0, W.stream>>>(st, ls, clip); }
+void adamw_d(void* p, DType dtp, const void* g, DType dtg, void* m, void* v, size_t n, float lr, float b1, float b2,
+             float eps, float wd, const OptState* st) {
+  auto launch = [&](auto tp) {
+    using TP = decltype(tp);
+    with_type(dtg, [&](auto t) { using TT = decltype(t);
+      k_adamw_d<TP, TT><<<blocks(n), 256, 0, W.stream>>>(static_cast<TP*>(p), static_cast<const TT*>(g), static_cast<TP*>(m),
+          static_cast<TP*>(v), n, TP(lr), TP(b1), TP(b2), TP(eps), TP(wd), st); });
+  };
+  if (dtp == DType::F64) launch(double{}); else if (dtp == DType::F32) launch(float{}); else fail("master must be fp32/fp64");
+}
+
+// ---------------- CUDA graphs ----------------
+void graph_begin() {
+  // Thread-local capture mode: worker threads of the hier transport capture concurrently.
+  CUDA_OK(cudaStreamBeginCapture(W.stream, cudaStreamCaptureModeThreadLocal));
+  W.capturing = true;
+}
+void* graph_end(const char* dot) {
+  cudaGraph_t g = nullptr;
+  CUDA_OK(cudaStreamEndCapture(W.stream, &g));
+  W.capturing = false;
+  if (dot && *dot) cudaGraphDebugDotPrint(g, dot, cudaGraphDebugDotFlagsVerbose);
+  cudaGraphExec_t e = nullptr;
+  CUDA_OK(cudaGraphInstantiateWithFlags(&e, g, 0));
+  CUDA_OK(cudaGraphDestroy(g));
+  return reinterpret_cast<void*>(e);
+}
+void graph_launch(void* e) { CUDA_OK(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(e), W.stream)); }
+void graph_destroy(void* e) { cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(e)); }
+size_t free_memory() { size_t f = 0, t = 0; CUDA_OK(cudaMemGetInfo(&f, &t)); return f; }
+void* arena_reserve(size_t bytes) { void* p = nullptr; if (cudaMalloc(&p, bytes) != cudaSuccess) return nullptr; return p; }
+void arena_release(void* p, size_t) { cudaStreamSynchronize(W.stream); cudaFree(p); }
 
 // ---------------- transport engine helpers ----------------
 void xfer_copy(int device, void* d, const void* s, size_t b) {

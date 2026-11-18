@@ -56,5 +56,19 @@ run 2 "hier: EP4 remote router"       --preset moe-tiny --dp 4 --ep 4 --router r
 run 4 "hier: EP8 node-limited M=1"    --preset moe-tiny --dp 8 --ep 8 --router node-limited --max-nodes 1 --transport hier --workers-per-node 2
 run 4 "hier: EP8 distance ring b=2"   --preset moe-tiny --dp 8 --ep 8 --router distance --distance-beta 2 --topology ring --transport hier --workers-per-node 2
 run 2 "hier: CP2 TP2 DP2 bf16 (2 nodes)" --preset tiny --cp 2 --tp 2 --dp 2 --precision bf16 --transport hier --workers-per-node 4
+# trace record / in-process replay / save + reload round trips (scripts/replay_check.sh)
+rt() {
+  local name=$1; shift
+  if out=$(BIN=$BIN LAUNCH=$LAUNCH "$(dirname "$0")/replay_check.sh" "$@" 2>&1); then
+    printf "PASS  %-34s %s\n" "replay: $name" "$(echo "$out" | cut -c42- | cut -d'|' -f3)"; pass=$((pass+1))
+  else printf "FAIL  %-34s\n" "replay: $name"; echo "$out" | tail -6; fail=$((fail+1)); fi
+}
+rt "TP4+SP"                 "replay TP4+SP" 4 --preset tiny --tp 4 --sp
+rt "FSDP4 overlap"          "replay FSDP4" 4 --preset tiny --fsdp 4 --overlap
+rt "PP4 1f1b"               "replay PP4" 4 --preset tiny --layers 4 --pp 4 --microbatches 4
+rt "MoE TP2+SP+EP2 FSDP"    "replay MoE" 4 --preset moe-tiny --tp 2 --sp --fsdp 2 --ep 2
+rt "4D rc bf16"             "replay 4D" 8 --preset tiny --tp 2 --sp --pp 2 --fsdp 2 --recompute --microbatches 3 --precision bf16
+rt "fp16 loss scale"        "replay fp16" 4 --preset tiny --fsdp 4 --precision fp16 --grad-dtype compute
+rt "hier EP4 local"         "replay hier EP4" 2 --preset moe-tiny --dp 4 --ep 4 --router local --transport hier --workers-per-node 2
 echo "----"; echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

@@ -37,7 +37,25 @@
   void xfer_reduce(int device, void* dst, const void* const* srcs, int k, size_t n, DType dt, bool acc); \
   void xfer_sync(int device);                                                                        \
   void set_tf32(bool on);                                                                            \
-  const char* gemm_engine();
+  const char* gemm_engine();                                                                         \
+  void copy_rows_d(const void* src, Int lds, bool src_rm, const int* srow, void* dst, Int ldd,       \
+                   bool dst_rm, const int* drow, Int n, Int width, const float* w, bool acc, DType dt); \
+  void col_max_d(const void* L, Int rows, Int cols, Int ld, DType dt, float* out);                   \
+  void col_sumexp_d(const void* L, Int rows, Int cols, Int ld, DType dt, const float* mx, float* out); \
+  void xent_grad_d(void* L, Int rows, Int cols, Int ld, DType dt, const float* mx, const float* sm,  \
+                   const int* tgt, float scale);                                                     \
+  void max_blocks(float* dst, const float* src, int p, size_t n);                                    \
+  void sumsq_acc(const void* x, size_t n, DType dt, double* acc, double weight);                     \
+  void opt_update(OptState* st, float loss_scale, float clip);                                       \
+  void adamw_d(void* p, DType dtp, const void* g, DType dtg, void* m, void* v, size_t n, float lr,  \
+               float b1, float b2, float eps, float wd, const OptState* st);                          \
+  void graph_begin();                                                                                \
+  void* graph_end(const char* dot);                                                                  \
+  void graph_launch(void* e);                                                                        \
+  void graph_destroy(void* e);                                                                       \
+  size_t free_memory();                                                                              \
+  void* arena_reserve(size_t bytes);                                                                 \
+  void arena_release(void* p, size_t bytes);
 
 namespace xpsim::dev::cpu { XPSIM_BACKEND_DECLS }
 namespace xpsim::dev::gpu {

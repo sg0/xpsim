@@ -95,6 +95,13 @@ drop rate, expert-load imbalance and the a2a bytes split.
 - `--sync-collectives` inserts a barrier before each collective, so load-imbalance
   skew (`sync_wait`) is separated from transfer time.
 
+**Clusters.** NERSC Perlmutter batch scripts (functional tests, CPU/GPU weak and strong
+scaling, both transports) are in `scripts/perlmutter/` (see its README).
+
+**Replay.** `--replay off|eager|graph`, `--trace-save P`, `--trace-load P`, `--graph-dot P`,
+`--arena-mb MB`: record one step and replay it as CUDA graphs, in-process or later from a
+file (see §4).
+
 **Output.** `--json f`, `--csv f` (appends one row: ideal for sweeps, see
 `scripts/sweep.sh`), `--label`, `--verbose` (per-iteration times and grad norm),
 `--selftest` (verifies all collectives / P2P / DistMatrix redistributions on the
@@ -133,9 +140,64 @@ directly to a CUDA-aware MPI. 16-bit reductions stage through host memory, becau
 user-defined MPI ops are host-only: prefer `--grad-dtype fp32` (default) or `hier`.
 
 ---------------------------------------------------------------------------------
-## 4. Code map (Elemental-style matrices)
+## 4. Trace record & replay (CUDA graphs)
 
-Check: Poulson, Jack, et al. "Elemental: A new framework for distributed memory dense matrix computations." ACM Transactions on Mathematical Software (TOMS) 39.2 (2013): 1-24.
+xpsim can record one training step (every device op and every communication call)
+and replay it, either in the same run or later from files:
+
+```bash
+# in-process: warm-up step 0 runs live and is recorded, measured steps replay it
+mpirun -np 16 ./bin/xpsim --device gpu --precision bf16 --tp 4 --sp --fsdp 4 --replay graph
+# record + save for later (P.manifest + P.w<worker>.xpt)
+mpirun -np 16 ./bin/xpsim ... --replay graph --trace-save $SCRATCH/traces/llama8b-tp4
+# later, any job: rebuild the CUDA graphs from the files and replay compute + communication
+mpirun -np 16 ./bin/xpsim --trace-load $SCRATCH/traces/llama8b-tp4 --iters 50
+srun -N 4 --ntasks-per-node=1 ./bin/xpsim --trace-load $SCRATCH/traces/llama8b-tp4 --transport hier
+```
+
+| option | meaning |
+|---|---|
+| `--replay off\|eager\|graph` | record the last warm-up step, then replay the measured steps. `graph`: one CUDA graph per compute segment (GPU); `eager`: re-issue the recorded ops (CPU or GPU) |
+| `--trace-save P` | also write the recorded step: `P.manifest` (the full command line) and one `P.w<worker>.xpt` per worker |
+| `--trace-load P` | build no model: take the configuration from `P.manifest`, allocate a fresh arena, run the recorded initialization, then replay the step every iteration (default mode: `graph` on GPU, `eager` on CPU) |
+| `--graph-dot P` | dump every captured CUDA graph as Graphviz DOT (`P.w<k>.seg<i>.dot`) |
+| `--arena-mb MB` | size of the per-worker replay arena (default 85% of free GPU memory; 16 GiB of virtual memory on CPU) |
+
+**How it works.**
+- **Arena.** With replay or tracing enabled, all model memory comes from one pre-reserved
+  region per worker, and every op stores its buffers as *offsets* into it. Host-side
+  inputs (token ids, targets, MoE routing indices and weights) are stored as constants.
+  A trace therefore does not depend on addresses: a later process reserves its own arena
+  and rebuilds the graphs against the new base address. CUDA cannot serialize a
+  `cudaGraph_t` itself; this recipe is what gets saved.
+- **Device-resident step.** The vocab-parallel loss statistics, the global gradient norm,
+  clipping, the fp16 overflow skip and the AdamW step count all stay on the GPU
+  (`dev::OptState`), so a step contains no host decision and no device-to-host copy.
+- **Communication.** Collectives and point-to-point calls are recorded at the `Comm` front
+  end with their communicator's creation index and request ids. Replay issues the same
+  calls (overlap and non-blocking structure included), so timing, bytes and the
+  intra/inter-node split are accounted exactly as in a live run. Communication cannot be
+  stream-captured over MPI or the hierarchical engine, so the step is split at
+  communication calls into compute segments; each segment is one CUDA graph,
+  instantiated once and launched every iteration (thread-local capture, so the hier
+  transport's GPU workers capture concurrently; fixed cuBLAS workspace).
+- **Report.** Each segment's wall time is attributed to categories in proportion to the
+  per-op times measured while recording; FLOPs are counted from the recorded ops. The
+  report's `execution` line shows the mode, op count, segment count and graph count.
+
+**What may differ between record and replay**: iterations, warm-up, replay mode, transport
+(`mpi` <-> `hier`), workers per node, device (cpu <-> gpu), timing and output options.
+Model and parallelism options cannot change; trying to raises an error.
+
+**Semantics.** Every replayed step reuses the recorded step's data, i.e. the same tokens
+and the same MoE routing (as with `--router-static`). Parameters and optimizer state
+evolve normally. Replaying a saved trace from a fresh process reproduces the in-process
+run bit for bit on CPU. `scripts/replay_check.sh` checks this, and `make test` runs it
+for 7 configurations (TP+SP, FSDP, PP, MoE, 4-D with recompute in bf16, fp16 with loss
+scaling, hier transport).
+
+---------------------------------------------------------------------------------
+## 5. Code map (Elemental-style matrices)
 
 | file | content |
 |---|---|
@@ -148,6 +210,7 @@ Check: Poulson, Jack, et al. "Elemental: A new framework for distributed memory 
 | `include/xpsim/comm.hpp`, `src/comm.cpp`, `src/comm_hier.cpp`, `src/comm_vmm.cpp` | worker-level `Comm`, MPI transport, hierarchical engine, VMM windows |
 | `include/xpsim/device.hpp`, `src/device*.{cpp,cu}` | backend: CPU (OpenMP blocked GEMM or CBLAS) and CUDA (cuBLAS GemmEx + kernels); allocation tracking |
 | `src/metrics.cpp`, `src/report.cpp` | counters and report |
+| `include/xpsim/trace.hpp`, `src/trace.cpp` | trace recording, file format, replayer (eager / CUDA graphs) |
 | `src/selftest.cpp` | transport / redistribution verification |
 | `tools/mpishim` | thread-based MPI subset for testing without MPI |
 
@@ -160,7 +223,7 @@ Check: Poulson, Jack, et al. "Elemental: A new framework for distributed memory 
   16-bit operands are widened to fp32.
 
 ---------------------------------------------------------------------------------
-## 5. Figures of merit and metrics
+## 6. Figures of merit and metrics
 
 | metric | definition |
 |---|---|
@@ -178,15 +241,26 @@ The JSON contains all of the above plus per-iteration times. The CSV has one row
 per run.
 
 ---------------------------------------------------------------------------------
-## 6. Validation
-- CPU builds with the MPI shim.
-- Check if `--selftest` passes on transports (1–3 nodes, fp32/fp64/bf16/fp16, AR/AG/RS/A2Av/P2P/DistMatrix).
-- Check if all  the configurations in `scripts/run_tests.sh` pass.
-- Check if ThreadSanitizer is clean on the hierarchical engine.
-- Compare gradient norms (bit-identical) between `mpi` and `hier` transports.
-- Compare reported FLOPs with the analytic model.
+## 7. Validation done, and limitations
 
-## 7. Limitations
+Done in the build environment (no MPI, no GPU there): CPU builds with the MPI shim.
+- `--selftest` passes on both transports (1–3 nodes, fp32/fp64/bf16/fp16, AR/AG/RS/A2Av/P2P/DistMatrix).
+- All 42 cases in `scripts/run_tests.sh` pass: 35 configurations plus 7 trace round trips.
+  In each round trip, in-process replay and replay from saved files in a fresh process give
+  bit-identical gradient norms, counted FLOPs and communication volume; a trace recorded
+  on `mpi` also replays on `hier`.
+- ThreadSanitizer is clean on the hierarchical engine.
+- Gradient norms are bit-identical between `mpi` and `hier` transports.
+- Counted FLOPs equal the analytic model.
+
+**Not yet exercised:** `device_cuda.cu` and `comm_vmm.cpp`, including CUDA-graph capture
+(`--replay graph`). They were written against CUDA 12 / cuBLAS / VMM APIs but never
+compiled or run (no CUDA toolkit or GPU was available), so expect a compile-fix pass on
+the first `make CUDA=1`. On CPU, `--replay graph` falls back to `eager`, which runs the
+same recorded op stream and segmentation. The
+shim build is for functional testing only; measure with a real MPI.
+
+**Modelling simplifications:**
 - No LayerNorm/bias/dropout.
 - GELU 2-matrix MLP: for SwiGLU FLOP parity set `--ffn` to 1.5× the SwiGLU width.
 - Attention materializes the score matrix (no flash attention) and computes the

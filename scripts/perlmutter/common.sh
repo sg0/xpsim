@@ -51,7 +51,7 @@ xp_case() {
   fi
   xp_launch "$nodes" "$@"
   mkdir -p "$XP_OUT/logs"
-  local log="$XP_OUT/logs/$(echo "$name" | tr ' /:()+,' '_______').log"
+  local log; log=$(xp_log_of "$name")
   if [ "${XP_DRYRUN:-0}" = 1 ]; then
     printf "DRY   %-44s %s\n" "$name" "${XP_CMD[*]}"; XP_PASS=$((XP_PASS + 1)); return 0
   fi
@@ -67,6 +67,17 @@ xp_case() {
     XP_FAIL=$((XP_FAIL + 1))
   fi
 }
+
+xp_log_of() { echo "$XP_OUT/logs/$(echo "$1" | tr ' /:()+,|' '________').log"; }
+xp_norms() { grep "grad-norm" "$1" 2>/dev/null | sed 's/.*grad-norm \([^ ]*\).*/\1/' | tr '\n' ' '; }
+# xp_same_norms <name> <case A name> <case B name>: grad-norm sequences of two logged cases agree
+xp_same_norms() {
+  local a b; a=$(xp_norms "$(xp_log_of "$2")"); b=$(xp_norms "$(xp_log_of "$3")")
+  if [ "${XP_DRYRUN:-0}" = 1 ]; then printf "DRY   %-44s compare grad norms\n" "$1"; return 0; fi
+  if [ -n "$a" ] && [ "$a" = "$b" ]; then printf "PASS  %-44s grad norms identical (%s)\n" "$1" "$(echo $a | wc -w) iters"; XP_PASS=$((XP_PASS + 1))
+  else printf "FAIL  %-44s\n      A: %s\n      B: %s\n" "$1" "$a" "$b"; XP_FAIL=$((XP_FAIL + 1)); fi
+}
+xp_replay_mode() { if [ "$XP_PART" = gpu ]; then echo graph; else echo eager; fi; }
 
 xp_summary() { echo "----"; echo "passed $XP_PASS, failed $XP_FAIL, skipped $XP_SKIP"; [ "$XP_FAIL" -eq 0 ]; }
 

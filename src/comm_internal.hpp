@@ -25,6 +25,7 @@ struct ReqState {
   virtual ~ReqState() = default;
   Cat cat = Cat::MISC_COMM;
   bool waited = false;
+  int trace_id = -1;  // request id inside a recorded trace
 };
 
 class CommImpl {
@@ -33,6 +34,7 @@ class CommImpl {
   Role role = Role::WORLD;
   std::vector<int> members;  // global worker ids, in rank order
   int rank = 0, nodes = 1;
+  int reg_index = -1;  // creation index (communicator registry, used by trace replay)
   virtual std::shared_ptr<ReqState> post(const OpDesc& op) = 0;
   virtual void wait(ReqState& r) = 0;
 };

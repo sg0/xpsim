@@ -8,7 +8,7 @@ Batch kit for functional tests and CPU/GPU scalability experiments on Perlmutter
 |---|---|
 | `env.sh gpu\|cpu` | modules (PrgEnv-gnu, cray-libsci, cudatoolkit, craype-accel-nvidia80), `MPICH_GPU_SUPPORT_ENABLED=1`, `MPICH_OFI_NIC_POLICY=GPU`, output dir (`$SCRATCH/xpsim-results`) |
 | `build.sh [gpu\|cpu]` | builds `bin/xpsim-gpu` (CUDA sm_80, CUDA-aware Cray MPICH, VMM) and `bin/xpsim-cpu` (LibSci CBLAS + OpenMP) with the `CC` wrapper |
-| `tests_gpu.sbatch`, `tests_cpu.sbatch` | functional matrix (port of `scripts/run_tests.sh`): 39 cases, every parallelism and mix, both transports, plus real inter-node DP/FSDP/EP cases; 4 nodes, debug QOS |
+| `tests_gpu.sbatch`, `tests_cpu.sbatch` | functional matrix (port of `scripts/run_tests.sh`): 53 cases, every parallelism and mix, both transports, real inter-node DP/FSDP/EP cases, in-process replay (CUDA graphs on GPU) and trace save -> reload round trips on both transports with grad-norm comparison; 4 nodes, debug QOS |
 | `scaling_gpu.sbatch`, `scaling_cpu.sbatch` | weak and strong scaling over 1, 2, 4, ... nodes inside one allocation, both transports, MoE router-locality sweep at the largest scale |
 | `common.sh`, `tests_cases.sh`, `scaling_cases.sh` | launch logic and case tables (shared by CPU and GPU) |
 | `bind.sh` | per-rank GPU affinity (local rank i -> GPU 3-i when 4 ranks/node, `--gpu-bind=none`) |
@@ -51,6 +51,7 @@ summary at any time with `python3 scripts/perlmutter/summarize.py <csv>`.
 | `XP_GB` | 256 / 512 | global batch (sequences) for `fsdp_strong` |
 | `XP_ITERS`, `XP_WARMUP` | 8, 2 / 5, 1 | measured / warm-up iterations |
 | `XP_PEAK`, `XP_TF32` | A100 dense peak (312 bf16/fp16, 19.5 fp64/fp32, 156 TF32) / measured | MFU denominator per worker |
+| `XP_REPLAY` | `off` | e.g. `"off graph"`: also run every case with in-process CUDA-graph replay (labels `mpi+graph`, `hier+graph`); the summary compares all variants |
 | `XP_DRYRUN=1` | | print the srun lines only |
 
 Efficiency definitions: weak = tokens/s per worker relative to the smallest run;
@@ -58,8 +59,11 @@ strong = speedup / worker ratio. For 80 GB A100 nodes add `-C "gpu&hbm80g"`.
 
 ## Notes and caveats
 
-- **GPU build:** Submit `tests_gpu.sbatch` first; its two selftest cases check every collective 
-  on both transports.
+- **Tested:** the scripts were exercised end to end with a fake `srun` mapped onto the
+  thread-based MPI shim: all 53 functional cases, the 44-case scaling run, the CSV and the
+  summary. They have not been run under real Slurm on Perlmutter.
+- **GPU build:** the CUDA backend and VMM transport have not been compiled yet. Submit
+  `tests_gpu.sbatch` first; its two selftest cases check every collective on both transports.
 - **hier transport on GPU:** needs a CUDA-aware Cray MPICH that accepts CUDA VMM
   (`cuMemCreate`/`cuMemMap`) device pointers for inter-node messages. If the hier
   selftest fails, rerun with `XP_TRANSPORTS=mpi`, or try `--gdr 0`.

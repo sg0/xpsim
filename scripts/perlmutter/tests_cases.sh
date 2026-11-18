@@ -55,4 +55,25 @@ xp_test_matrix() {
   t_hier "EP8 distance ring b=2"        8 2 --preset moe-tiny --dp 8 --ep 8 --router distance --distance-beta 2 --topology ring
   t_hier "CP2 TP2 DP2 bf16"             8 4 --preset tiny --cp 2 --tp 2 --dp 2 --precision bf16
   t_hier "TP4+SP x DP4 bf16"           16 4 --preset tiny --tp 4 --sp --dp 4 --precision bf16
+  # trace record / replay (GPU: CUDA graphs per compute segment; CPU: eager re-issue)
+  local RM; RM=$(xp_replay_mode)
+  t_mpi  "replay-$RM TP4+SP"            4  --preset tiny --tp 4 --sp --replay "$RM"
+  t_hier "replay-$RM EP8 MoE"           8 4 --preset moe-tiny --dp 8 --ep 8 --replay "$RM"
+  t_roundtrip "FSDP16 overlap"         16  --preset tiny --fsdp 16 --overlap
+  t_roundtrip "3D TP2 PP2 DP4 bf16"    16  --preset tiny --tp 2 --pp 2 --dp 4 --microbatches 4 --precision bf16
+  t_roundtrip "MoE TP2+SP EP4 FSDP2"   16  --preset moe-tiny --tp 2 --sp --fsdp 2 --dp 4 --ep 4
+}
+
+# Save a trace (mpi transport, in-process replay), rebuild + replay it in new jobs on
+# the mpi and on the hier transport; grad norms of record and reload must agree.
+t_roundtrip() { local name=$1 W=$2; shift 2
+  local RM; RM=$(xp_replay_mode)
+  local tpn=$(( W < XP_TPN ? W : XP_TPN )); local nodes=$(( (W + tpn - 1) / tpn ))
+  local pre="$XP_OUT/traces/$(echo "$name" | tr ' /+:()' '______')"; mkdir -p "$XP_OUT/traces"
+  local rec="trace-save $name [mpi ${nodes}x${tpn}]" lm="trace-load $name [mpi ${nodes}x${tpn}]"
+  local lh="trace-load $name [hier ${nodes}x${tpn}]"
+  xp_case "$rec" "$nodes" "$tpn" mpi 1 -- $PEAK --verbose --replay "$RM" --trace-save "$pre" "$@"
+  xp_case "$lm"  "$nodes" "$tpn" mpi 1 -- $PEAK --verbose --replay "$RM" --trace-load "$pre"
+  xp_case "$lh"  "$nodes" 1 hier "$tpn" -- $PEAK --verbose --replay "$RM" --trace-load "$pre"
+  xp_same_norms "round trip $name (record vs reload)" "$rec" "$lm"
 }

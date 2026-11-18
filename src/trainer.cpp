@@ -17,10 +17,13 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <fstream>
 #include <random>
 #include "xpsim/flat_param.hpp"
 #include "xpsim/grid.hpp"
 #include "xpsim/moe_router.hpp"
+#include "xpsim/trace.hpp"
+#include <functional>
 
 namespace xpsim {
 
@@ -96,9 +99,9 @@ class Trainer {
       head_->add("Wout", h_, V_); head_->finalize(cfg.seed + 3 + g.me.t, 0.02f);
     }
     mb_.resize(m_);
+    { dev::MemScope ms("optimizer"); opt_ = static_cast<dev::OptState*>(dev::alloc(sizeof(dev::OptState))); }
+    dev::memset_zero(opt_, sizeof(dev::OptState));
   }
-
-  void run();
 
  private:
   struct LayerCache {
@@ -465,19 +468,23 @@ class Trainer {
     if (cfg_.sp) gather_tp(Xo, st.head_hg); else { st.head_hg = act(T_l_, h_); Copy(Xo, st.head_hg); }
     st.dlt = act(V_, T_l_);
     Gemm(TR, TR, 1.f, head_->W(0), st.head_hg, 0.f, st.dlt, Cat::GEMM_FWD);  // logits^T (V_l x T_l)
-    std::vector<float> mx(T_l_), sm(T_l_);
     std::vector<int> tgt; make_tokens(iter, mb, tgt, 99);
     std::vector<int> ltgt(T_l_);
     for (Int i = 0; i < T_l_; ++i) { int id = tgt[i] - g_.me.t * V_; ltgt[i] = (id >= 0 && id < V_) ? id : -1; }
-    { ScopedTimer t(Cat::ELEMWISE); dev::col_max(st.dlt.LockedBuffer(), V_, T_l_, st.dlt.LDim(), Matrix<T>::dtype(), mx.data()); }
-    g_.tp.allreduce_max_host(mx.data(), int(T_l_), Cat::LOSS_AR);
-    { ScopedTimer t(Cat::ELEMWISE); dev::col_sumexp(st.dlt.LockedBuffer(), V_, T_l_, st.dlt.LDim(), Matrix<T>::dtype(), mx.data(), sm.data()); }
-    std::vector<double> smd(sm.begin(), sm.end());
-    g_.tp.allreduce_host(smd.data(), int(T_l_), Cat::LOSS_AR);
-    for (Int i = 0; i < T_l_; ++i) sm[i] = float(smd[i]);
+    // vocab-parallel softmax statistics stay on the device (graph-capturable)
+    Matrix<float> mx, sm;
+    int* tg;
+    { dev::MemScope ms("activations"); mx.Resize(T_l_, 1); sm.Resize(T_l_, 1); tg = static_cast<int*>(dev::alloc(T_l_ * sizeof(int))); }
+    dev::memcpy_h2d(tg, ltgt.data(), T_l_ * sizeof(int));
+    { ScopedTimer t(Cat::ELEMWISE); dev::col_max_d(st.dlt.LockedBuffer(), V_, T_l_, st.dlt.LDim(), Matrix<T>::dtype(), mx.Buffer()); }
+    g_.tp.allreduce_max(mx.Buffer(), size_t(T_l_), Cat::LOSS_AR);
+    { ScopedTimer t(Cat::ELEMWISE);
+      dev::col_sumexp_d(st.dlt.LockedBuffer(), V_, T_l_, st.dlt.LDim(), Matrix<T>::dtype(), mx.LockedBuffer(), sm.Buffer()); }
+    g_.tp.allreduce(sm.Buffer(), size_t(T_l_), DType::F32, Cat::LOSS_AR);
     const float scale = float(cfg_.loss_scale / double(cfg_.tokens_per_iter()));
     { ScopedTimer t(Cat::ELEMWISE);
-      dev::xent_grad(st.dlt.Buffer(), V_, T_l_, st.dlt.LDim(), Matrix<T>::dtype(), mx.data(), sm.data(), ltgt.data(), scale); }
+      dev::xent_grad_d(st.dlt.Buffer(), V_, T_l_, st.dlt.LDim(), Matrix<T>::dtype(), mx.LockedBuffer(), sm.LockedBuffer(), tg, scale); }
+    dev::free(tg);
     head_->release();
   }
   Matrix<T> head_bwd(MbState& st) {
@@ -585,17 +592,13 @@ class Trainer {
       if (mb_[mb].send_req.active()) sends.push_back(std::move(mb_[mb].send_req));
     }
     for (auto* p : params) p->finish_reductions();
-    // global gradient norm (+ overflow detection) -> clipping coefficient
-    double ss[1] = {0};
-    for (auto* p : params) ss[0] += p->grad_sumsq();
-    Comm::world().allreduce_host(ss, 1, Cat::GRADNORM_AR);
-    const double ls = cfg_.loss_scale;
-    const double norm = std::sqrt(ss[0]) / ls;
-    float gscale = float(1.0 / ls);
-    if (cfg_.clip_grad > 0 && std::isfinite(norm) && norm > cfg_.clip_grad) gscale *= float(cfg_.clip_grad / (norm + 1e-6));
-    grad_norm_ = norm;
-    if (std::isfinite(norm)) { ++step_; for (auto* p : params) p->step(step_, float(cfg_.lr), gscale); }
-    else if (metrics().recording) metrics().skipped_steps += 1;  // fp16 overflow: skip the update
+    // global gradient norm, clipping and fp16 overflow skip: all device-resident
+    double* norm2 = reinterpret_cast<double*>(opt_);  // OptState::norm2 is the first member
+    dev::memset_zero(norm2, sizeof(double));
+    for (auto* p : params) p->grad_sumsq_acc(norm2);
+    Comm::world().allreduce(norm2, 1, DType::F64, Cat::GRADNORM_AR);
+    dev::opt_update(opt_, float(cfg_.loss_scale), float(cfg_.clip_grad));
+    for (auto* p : params) p->step(float(cfg_.lr), opt_);
     for (auto* p : params) p->wait_post_step();
     g_.pp.waitall(sends);
     for (auto& st : mb_) { st.out.Empty(); st.dx_send.Empty(); }
@@ -606,37 +609,95 @@ class Trainer {
   std::unique_ptr<Router> router_;
   int h_, dh_, tp_, cp_, nq_, nkv_, grp_, wqkv_, kvw_, ffn_, V_, b_, E_, el_, effn_, m_;
   Int s_l_, T_l_, Ts_, rows_, s_k_;
-  int l0_ = 0, nl_ = 0, step_ = 0;
-  double grad_norm_ = 0;
+  int l0_ = 0, nl_ = 0;
+  dev::OptState* opt_ = nullptr;
   std::vector<std::unique_ptr<FP>> dense_, expert_;
   std::vector<bool> moe_;
   std::unique_ptr<FP> embed_, head_;
   std::vector<MbState> mb_;
 
  public:
-  double grad_norm() const { return grad_norm_; }
+  dev::OptState* opt_state() const { return opt_; }
+  void step(int iter) { train_step(iter); }
+  ~Trainer() { dev::free(opt_); }
 };
 
-template <typename T, typename GT>
-void Trainer<T, GT>::run() {
+// ------------------------------------------------------------------ driver
+dev::OptState read_opt(const dev::OptState* d) {
+  dev::OptState h{};
+  if (d) dev::memcpy_d2h(&h, d, sizeof(h));
+  return h;
+}
+
+// Shared iteration loop (live, record + in-process replay, replay from file).
+void run_loop(const Config& cfg, const std::function<void(int)>& step, const std::function<dev::OptState*()>& opt) {
   auto& m = metrics();
   auto& world = Comm::world();
-  const int total = cfg_.warmup + cfg_.iters;
+  const int total = cfg.warmup + cfg.iters;
+  int skip0 = 0;
   for (int it = 0; it < total; ++it) {
     world.barrier();
-    m.recording = it >= cfg_.warmup;
-    if (it == cfg_.warmup) dev::mem_reset_peak();
+    m.recording = it >= cfg.warmup;
+    if (it == cfg.warmup) {
+      if (m.replay.mode == "live") dev::mem_reset_peak();  // replay allocates nothing: keep the recorded step's peak
+      skip0 = read_opt(opt()).skipped_total;
+    }
     if (dev::is_gpu()) dev::sync();
     const double t0 = now_sec();
-    train_step(it);
+    step(it);
     if (dev::is_gpu()) dev::sync();
     const double dt = now_sec() - t0;
     if (m.recording) m.iter_times.push_back(dt);
-    if (cfg_.verbose && my_worker() == 0)
-      std::printf("  iter %3d %s %.4f s  grad-norm %.4e\n", it, m.recording ? "    " : "(wu)", dt, grad_norm_);
+    if (cfg.verbose) {
+      const dev::OptState o = read_opt(opt());
+      if (my_worker() == 0)
+        std::printf("  iter %3d %s %.4f s  grad-norm %.6e%s  [%s]\n", it, m.recording ? "    " : "(wu)", dt, o.norm,
+                    o.skip ? " (skipped)" : "", m.replay.mode == "live" || it <= int(m.replay.trace_iter) ? "live" : m.replay.mode.c_str());
+    }
   }
+  m.skipped_steps = read_opt(opt()).skipped_total - skip0;
   m.recording = false;
   world.barrier();
+}
+
+Replayer::Mode replay_mode(const Config& cfg) {
+  return cfg.replay == "graph" ? Replayer::Mode::GRAPH : Replayer::Mode::EAGER;
+}
+void set_replay_info(const Replayer& r, const Trace& t, const std::string& source, int trace_iter) {
+  auto& ri = metrics().replay;
+  ri.mode = r.mode() == Replayer::Mode::GRAPH ? "graph" : "eager";
+  ri.ops = double(t.step.size()); ri.segments = r.segments(); ri.compute_segments = r.compute_segments();
+  ri.graphs = r.graphs(); ri.build_s = r.build_seconds(); ri.source = source; ri.trace_iter = trace_iter;
+}
+size_t arena_bytes(const Config& cfg, size_t at_least) {
+  size_t b = cfg.arena_mb > 0 ? size_t(cfg.arena_mb * 1048576.0)
+                              : (dev::is_gpu() ? size_t(double(dev::free_memory()) * 0.85) : (size_t(16) << 30));
+  return std::max(b, at_least);
+}
+std::string trace_file(const std::string& prefix, int worker) { return prefix + ".w" + std::to_string(worker) + ".xpt"; }
+
+void finalize_trace(Trace& t, const Config& cfg, const dev::OptState* opt) {
+  t.args = cfg.args;
+  t.config_hash = hash_args(cfg.args);
+  t.world = world_size(); t.worker = my_worker(); t.backend = dev::is_gpu() ? 1 : 0;
+  t.arena_bytes = dev::arena_high_water();
+  t.opt_state = dev::arena_offset(opt);
+  t.mem_peak.clear();
+  for (auto& kv : dev::mem_stats()) t.mem_peak.push_back({kv.first, kv.second.peak});
+  t.mem_peak.push_back({"__total__", dev::mem_peak()});
+  t.comms.clear();
+  for (int i = 0; i < Comm::registry_size(); ++i) t.comms.push_back({int(Comm::from_index(i).role()), Comm::from_index(i).size()});
+}
+void save_trace(const Trace& t, const Config& cfg) {
+  t.save(trace_file(cfg.trace_save, my_worker()));
+  if (my_worker() == 0) {
+    std::ofstream mf(cfg.trace_save + ".manifest");
+    mf << "xpsim-trace 1\nworld " << t.world << "\nhash " << t.config_hash << "\nargs " << t.args.size() << "\n";
+    for (auto& a : t.args) mf << a << "\n";
+    std::printf("xpsim: trace written: %s.manifest + %d x %s.w<worker>.xpt (%zu step ops, %zu init ops on worker 0)\n",
+                cfg.trace_save.c_str(), t.world, cfg.trace_save.c_str(), t.step.size(), t.init.size());
+    std::fflush(stdout);
+  }
 }
 
 template <typename T, typename GT>
@@ -652,17 +713,79 @@ int train_t(const Config& cfg) {
     Comm::world().allreduce_host(p, 1, Cat::MISC_COMM);
     peak = p[0];
   }
+  const bool tracing = cfg.replay != "off" || !cfg.trace_save.empty();
+  Trace trace;
+  if (tracing) {
+    dev::arena_begin(arena_bytes(cfg, 0));
+    trace::begin(&trace, &trace.init);  // record model construction (parameter / optimizer init)
+  }
   {
     Trainer<T, GT> tr(cfg, g);
-    tr.run();
+    if (tracing) trace::end();
+    const int rec_iter = tracing ? cfg.warmup - 1 : -1;
+    if (tracing) metrics().replay.trace_iter = rec_iter;
+    std::unique_ptr<Replayer> rp;
+    run_loop(cfg, [&](int it) {
+      if (rp) { rp->run_step(); return; }
+      if (it == rec_iter) { dev::mem_reset_peak(); trace::begin(&trace, &trace.step); }
+      tr.step(it);
+      if (it != rec_iter) return;
+      trace::end();
+      finalize_trace(trace, cfg, tr.opt_state());
+      if (!cfg.trace_save.empty()) save_trace(trace, cfg);
+      if (cfg.replay != "off") {
+        rp = std::make_unique<Replayer>(trace, replay_mode(cfg), cfg.graph_dot);
+        set_replay_info(*rp, trace, "in-process", rec_iter);
+      }
+    }, [&] { return tr.opt_state(); });
+    rp.reset();
     report(cfg, g, peak, model_counts(cfg));
   }
+  if (tracing) dev::arena_end();
+  return 0;
+}
+
+// Replay a saved trace: no model is built; the init ops recreate parameters and
+// optimizer state in a fresh arena, then every iteration replays the step.
+int replay_file(const Config& cfg) {
+  metrics().reset();
+  metrics().sync_timers = cfg.sync_timers;
+  dev::set_tf32(cfg.tf32);
+  ProcessGrid g(cfg);
+  Trace t = Trace::load(trace_file(cfg.trace_load, my_worker()));
+  if (t.world != world_size()) fail("trace was recorded with " + std::to_string(t.world) + " workers, running " + std::to_string(world_size()));
+  if (t.worker != my_worker()) fail("trace file belongs to worker " + std::to_string(t.worker));
+  if (int(t.comms.size()) > Comm::registry_size()) fail("trace uses more communicators than this configuration creates");
+  for (size_t i = 0; i < t.comms.size(); ++i)
+    if (t.comms[i].first != int(Comm::from_index(int(i)).role()) || t.comms[i].second != Comm::from_index(int(i)).size())
+      fail("communicator " + std::to_string(i) + " differs from the recording (configuration mismatch)");
+  if (t.config_hash != hash_args(cfg.args) && my_worker() == 0)
+    std::fprintf(stderr, "xpsim: warning: configuration hash differs from the recording\n");
+  double peak = cfg.peak_tflops;
+  if (peak <= 0) {
+    double p[1] = {0};
+    if (my_worker() == 0) p[0] = dev::gemm_peak_tflops(cfg.precision, dev::is_gpu() ? 8192 : 512);
+    Comm::world().allreduce_host(p, 1, Cat::MISC_COMM);
+    peak = p[0];
+  }
+  dev::arena_begin(arena_bytes(cfg, size_t(t.arena_bytes) + (size_t(64) << 20)));
+  {
+    Replayer rp(t, replay_mode(cfg), cfg.graph_dot);
+    set_replay_info(rp, t, cfg.trace_load, -1);
+    rp.run_init();
+    for (auto& mp : t.mem_peak) dev::mem_note_peak(mp.first, size_t(mp.second));
+    dev::OptState* opt = t.opt_state >= 0 ? reinterpret_cast<dev::OptState*>(dev::arena_base() + t.opt_state) : nullptr;
+    run_loop(cfg, [&](int) { rp.run_step(); }, [&] { return opt; });
+    report(cfg, g, peak, model_counts(cfg));
+  }
+  dev::arena_end();
   return 0;
 }
 
 }  // namespace
 
 int run_training(const Config& cfg) {
+  if (!cfg.trace_load.empty()) return replay_file(cfg);
   switch (cfg.precision) {
     case DType::F32: return train_t<float, float>(cfg);
     case DType::F64: return train_t<double, double>(cfg);

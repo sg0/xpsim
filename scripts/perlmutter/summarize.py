@@ -42,16 +42,19 @@ def main(path):
                   f"{100*x['mfu']:>6.2f} {100*x['comm']:>6.1f} {x['mem']:>8.0f} {100*eff:>6.1f}")
             out_rows.append([strat, tr, mode, x["nodes"], x["workers"], x["iter"], x["tps"], x["mfu"], x["comm"],
                              x["mem"], eff])
-    # transport comparison at equal scale
+    # execution-variant comparison at equal scale (mpi, hier, mpi+graph, hier+graph, ...)
     pairs = defaultdict(dict)
     for (strat, tr, mode), g in groups.items():
         for x in g:
             pairs[(strat, mode, x["workers"])][tr] = x["iter"]
-    cmp = [(k, v) for k, v in sorted(pairs.items()) if "mpi" in v and "hier" in v]
+    cmp = [(k, v) for k, v in sorted(pairs.items()) if len(v) > 1]
     if cmp:
-        print("\ntransport comparison (iteration time, mpi / hier; >1 means hier is faster)")
+        print("\nvariant comparison (iteration time; speedup relative to the first variant listed)")
         for (strat, mode, w), v in cmp:
-            print(f"  {strat:<24} W={w:<5} mpi {v['mpi']:.4f} s  hier {v['hier']:.4f} s  ratio {v['mpi']/v['hier']:.3f}")
+            names = sorted(v, key=lambda t: (t != "mpi", t))
+            base = v[names[0]]
+            cols = "  ".join(f"{t} {v[t]:.4f}s (x{base / v[t]:.2f})" for t in names)
+            print(f"  {strat:<24} W={w:<5} {cols}")
     out = path.rsplit(".", 1)[0] + "_summary.csv"
     with open(out, "w", newline="") as f:
         w = csv.writer(f)

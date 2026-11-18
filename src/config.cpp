@@ -2,7 +2,9 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <fstream>
 #include <sstream>
+#include "xpsim/trace.hpp"
 
 namespace xpsim {
 
@@ -36,20 +38,55 @@ static void apply_preset(Config& c, const std::string& p) {
   else fail("unknown preset '" + p + "'");
 }
 
-Config parse_config(int argc, char** argv) {
-  Config c;
-  std::vector<std::pair<std::string, std::string>> kv;
-  for (int i = 1; i < argc; ++i) {
+namespace {
+using KV = std::vector<std::pair<std::string, std::string>>;
+KV split_args(const std::vector<std::string>& argv) {
+  KV kv;
+  for (size_t i = 0; i < argv.size(); ++i) {
     std::string a = argv[i];
     if (a.rfind("--", 0) != 0) fail("unexpected argument '" + a + "' (see --help)");
     a = a.substr(2);
     std::string v;
     auto eq = a.find('=');
     if (eq != std::string::npos) { v = a.substr(eq + 1); a = a.substr(0, eq); }
-    else if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) v = argv[++i];
+    else if (i + 1 < argv.size() && argv[i + 1].rfind("--", 0) != 0) v = argv[++i];
     else v = "1";
     kv.emplace_back(a, v);
   }
+  return kv;
+}
+// Arguments stored in <prefix>.manifest by --trace-save.
+std::vector<std::string> read_manifest(const std::string& prefix) {
+  std::ifstream f(prefix + ".manifest");
+  if (!f) fail("cannot open trace manifest " + prefix + ".manifest");
+  std::string magic, key; int ver = 0; size_t n = 0;
+  f >> magic >> ver;
+  if (magic != "xpsim-trace" || ver != 1) fail(prefix + ".manifest is not an xpsim trace manifest");
+  while (f >> key && key != "args") { std::string skip; f >> skip; }
+  f >> n; std::string line; std::getline(f, line);
+  std::vector<std::string> a;
+  for (size_t i = 0; i < n && std::getline(f, line); ++i) a.push_back(line);
+  return a;
+}
+}  // namespace
+
+Config parse_config(int argc, char** argv) {
+  Config c;
+  std::vector<std::string> cli(argv + 1, argv + argc);
+  KV kv = split_args(cli);
+  std::string load;
+  for (auto& [k, v] : kv) if (k == "trace-load") load = v;
+  if (!load.empty()) {  // configuration comes from the recording; only replay-safe options may be given
+    for (auto& [k, v] : kv)
+      if (!replay_safe_option(k)) fail("--" + k + " cannot be changed when replaying a trace (--trace-load)");
+    std::vector<std::string> rec = read_manifest(load);
+    KV base = split_args(rec);
+    KV merged;
+    for (auto& e : base) if (e.first != "trace-save" && e.first != "replay") merged.push_back(e);
+    for (auto& e : kv) merged.push_back(e);
+    kv = merged;
+    c.args = rec;
+  } else c.args = cli;
   for (auto& [k, v] : kv) if (k == "preset") apply_preset(c, v);  // presets first, flags override
   auto I = [](const std::string& v) { return std::stoi(v); };
   auto D = [](const std::string& v) { return std::stod(v); };
@@ -105,6 +142,11 @@ Config parse_config(int argc, char** argv) {
       {"iters", [&](auto& v) { c.iters = I(v); }}, {"warmup", [&](auto& v) { c.warmup = I(v); }},
       {"seed", [&](auto& v) { c.seed = std::stoull(v); }}, {"peak-tflops", [&](auto& v) { c.peak_tflops = D(v); }},
       {"sync-timers", [&](auto& v) { c.sync_timers = B(v); }}, {"verbose", [&](auto& v) { c.verbose = B(v); }}, {"selftest", [&](auto& v) { c.selftest = B(v); }},
+      {"replay", [&](auto& v) {
+         if (v != "off" && v != "eager" && v != "graph") { fail("--replay off|eager|graph"); }
+         c.replay = v; }},
+      {"trace-save", [&](auto& v) { c.trace_save = v; }}, {"trace-load", [&](auto& v) { c.trace_load = v; }},
+      {"graph-dot", [&](auto& v) { c.graph_dot = v; }}, {"arena-mb", [&](auto& v) { c.arena_mb = D(v); }},
       {"json", [&](auto& v) { c.json = v; }}, {"csv", [&](auto& v) { c.csv = v; }}, {"label", [&](auto& v) { c.label = v; }},
   };
   for (auto& [k, v] : kv) {
@@ -117,6 +159,9 @@ Config parse_config(int argc, char** argv) {
   if (c.expert_ffn == 0) c.expert_ffn = c.ffn;
   if (c.loss_scale == 0) c.loss_scale = c.precision == DType::F16 ? 65536.0 : 1.0;
   if (c.precision == DType::F64) c.grad_fp32 = false;  // fp64 grads
+  if (!c.trace_load.empty() && c.replay == "off") c.replay = c.gpu ? "graph" : "eager";
+  if ((c.replay != "off" || !c.trace_save.empty()) && c.trace_load.empty() && c.warmup < 1) c.warmup = 1;  // record a warm-up step
+  if (c.replay == "graph" && !c.gpu) c.replay = "eager";  // CUDA graphs need the GPU backend
   if (c.selftest && c.tp * c.pp * c.dp * c.fsdp * c.cp == 1) c.dp = -1;  // any world size
   c.rt.gpu = c.gpu;
   return c;
@@ -173,6 +218,13 @@ transport --transport mpi|hier  --cuda-aware 0|1  --workers-per-node n  --ranks-
 run       --iters N --warmup W --seed s --peak-tflops T (0 = measure) --sync-timers 0|1
           --json file --csv file --label name --verbose
           --selftest           verify all collectives / P2P / DistMatrix redistributions and exit
+replay    --replay off|eager|graph   record the last warm-up step, then replay the measured steps
+                       (graph: one CUDA graph per compute segment between communication calls)
+          --trace-save P       write the recorded step to P.manifest + P.w<worker>.xpt
+          --trace-load P       rebuild and replay a saved trace (full compute + communication);
+                       only replay-safe options (iters, warmup, replay, transport, ...) may be given
+          --graph-dot P        dump each captured CUDA graph as P.w<worker>.seg<k>.dot
+          --arena-mb MB        replay arena per worker (default: 85% of free GPU memory / 16 GiB CPU)
 )";
 }
 

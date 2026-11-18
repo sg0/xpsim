@@ -8,6 +8,7 @@
 #include <thread>
 #include "comm_internal.hpp"
 #include "xpsim/half_host.hpp"
+#include "xpsim/trace.hpp"
 
 namespace xpsim {
 
@@ -30,11 +31,20 @@ const RuntimeOptions& runtime_options() { return t_rt->opt; }
 int process_rank() { return t_rt ? t_rt->rank : 0; }
 
 // =================================================================== Comm
+static thread_local std::vector<Comm> t_registry;
 Comm Comm::create(Role role, const std::vector<int>& members) {
   Comm c;
   c.impl_ = t_rt->opt.transport == Transport::MPI ? make_mpi_comm(role, members) : make_hier_comm(role, members);
+  c.impl_->reg_index = int(t_registry.size());
+  t_registry.push_back(c);
   return c;
 }
+Comm& Comm::from_index(int i) {
+  if (i < 0 || i >= int(t_registry.size())) fail("communicator index " + std::to_string(i) + " not created on this worker");
+  return t_registry[i];
+}
+int Comm::registry_size() { return int(t_registry.size()); }
+int Comm::index() const { return impl_->reg_index; }
 static thread_local Comm t_world;
 Comm& Comm::world() { return t_world; }
 int Comm::rank() const { return impl_->rank; }
@@ -79,6 +89,17 @@ Acct account(const CommImpl& c, const OpDesc& op) {
 
 static Request post_op(CommImpl& impl, const OpDesc& op, Cat cat) {
   auto& m = metrics();
+  int tid = -1;
+  if (trace::active()) {  // record the call; everything below is communication internals
+    tid = trace::next_request_id();
+    const int p = int(impl.members.size());
+    std::vector<int64_t> a = {impl.reg_index, int64_t(op.type), trace::ptr(op.sbuf), trace::ptr(op.rbuf), int64_t(op.n),
+                              int64_t(op.dt), op.peer, op.tag, int64_t(cat), tid, p};
+    if (op.type == OpDesc::A2AV)
+      for (auto* v : {&op.scounts, &op.sdispls, &op.rcounts, &op.rdispls}) for (size_t x : *v) a.push_back(int64_t(x));
+    trace::rec_vec(TOpKind::C_POST, std::move(a));
+  }
+  dev::Suspend suspend;
   if (t_rt->opt.sync_collectives && op.type != OpDesc::SEND && op.type != OpDesc::RECV && op.type != OpDesc::BARRIER) {
     OpDesc b; b.type = OpDesc::BARRIER;
     double t0 = now_sec();
@@ -91,11 +112,14 @@ static Request post_op(CommImpl& impl, const OpDesc& op, Cat cat) {
   double t0 = now_sec();
   Request r{impl.post(op)};
   r.s->cat = cat;
+  r.s->trace_id = tid;
   if (m.recording) { m.cat[int(cat)].time += now_sec() - t0; m.cat[int(cat)].calls += 1; }
   return r;
 }
 void Comm::wait(Request& r) {
   if (!r.s || r.s->waited) return;
+  if (trace::active() && r.s->trace_id >= 0) trace::rec(TOpKind::C_WAIT, {impl_->reg_index, r.s->trace_id});
+  dev::Suspend suspend;
   double t0 = now_sec();
   impl_->wait(*r.s);
   r.s->waited = true;
@@ -135,22 +159,48 @@ void Comm::alltoallv(const void* s, const std::vector<size_t>& sc, const std::ve
   o.scounts = sc; o.sdispls = sd; o.rcounts = rc; o.rdispls = rd;
   auto q = post_op(*impl_, o, cat); wait(q);
 }
-void Comm::barrier(Cat cat) { OpDesc o; o.type = OpDesc::BARRIER; auto q = post_op(*impl_, o, cat); wait(q); }
+void Comm::barrier(Cat cat) { auto q = ibarrier(cat); wait(q); }
+Request Comm::ibarrier(Cat cat) { OpDesc o; o.type = OpDesc::BARRIER; return post_op(*impl_, o, cat); }
+Request Comm::ialltoallv(const void* s, const std::vector<size_t>& sc, const std::vector<size_t>& sd, void* r,
+                         const std::vector<size_t>& rc, const std::vector<size_t>& rd, DType dt, Cat cat) {
+  OpDesc o; o.type = OpDesc::A2AV; o.sbuf = s; o.rbuf = r; o.dt = dt;
+  o.scounts = sc; o.sdispls = sd; o.rcounts = rc; o.rdispls = rd;
+  return post_op(*impl_, o, cat);
+}
+void Comm::allreduce_max(float* buf, size_t n, Cat cat) {
+  if (size() == 1 || n == 0) return;
+  float* all = static_cast<float*>(dev::alloc(n * size() * sizeof(float)));
+  allgather(buf, all, n, DType::F32, cat);
+  dev::max_blocks(buf, all, size(), n);
+  dev::free(all);
+}
+// Host helpers are recorded as one op (inputs as constants) and replayed as calls.
+static bool rec_host(const Comm& c, int which, int n, Cat cat, const void* in, size_t bytes) {
+  if (!trace::active()) return false;
+  trace::rec(TOpKind::C_HOST, {c.index(), which, n, int64_t(cat), trace::cst(in, bytes)});
+  return true;
+}
 
 // Host helpers: stage through device memory so both transports apply.
 void Comm::allreduce_host(double* buf, int n, Cat cat) {
+  rec_host(*this, 0, n, cat, buf, size_t(n) * 8);
+  dev::Suspend suspend;
   if (size() == 1) return;
   void* d = dev::alloc(n * 8); dev::memcpy_h2d(d, buf, n * 8);
   allreduce(d, n, DType::F64, cat);
   dev::memcpy_d2h(buf, d, n * 8); dev::free(d);
 }
 void Comm::allgather_host(const double* s, double* r, int n, Cat cat) {
+  rec_host(*this, 1, n, cat, s, size_t(n) * 8);
+  dev::Suspend suspend;
   void* d = dev::alloc(size_t(n) * 8 * (size() + 1));
   dev::memcpy_h2d(d, s, n * 8);
   allgather(d, static_cast<char*>(d) + n * 8, n, DType::F64, cat);
   dev::memcpy_d2h(r, static_cast<char*>(d) + n * 8, size_t(n) * 8 * size()); dev::free(d);
 }
 void Comm::allreduce_max_host(float* buf, int n, Cat cat) {
+  rec_host(*this, 2, n, cat, buf, size_t(n) * 4);
+  dev::Suspend suspend;
   if (size() == 1) return;
   std::vector<double> s(buf, buf + n), r(size_t(n) * size());
   allgather_host(s.data(), r.data(), n, cat);
@@ -162,6 +212,8 @@ void Comm::allreduce_max_host(float* buf, int n, Cat cat) {
 }
 void Comm::alltoall_host(const long long* s, long long* r, int n_per, Cat cat) {
   const int p = size();
+  rec_host(*this, 3, n_per, cat, s, size_t(p) * n_per * 8);
+  dev::Suspend suspend;
   std::vector<size_t> c(p, n_per), d(p);
   for (int j = 0; j < p; ++j) d[j] = size_t(j) * n_per;
   char* db = static_cast<char*>(dev::alloc(size_t(2) * p * n_per * 8));
@@ -339,7 +391,7 @@ int run_workers(int argc, char** argv, const RuntimeOptions& opt, int (*worker_m
       } else dev::init(dev::Backend::CPU, 0);
       init_world_comm();
       rc = worker_main(argc, argv);
-      t_world = Comm();
+      t_world = Comm(); t_registry.clear();
       dev::finalize();
     } catch (const std::exception& e) {
       std::fprintf(stderr, "[rank %d] error: %s\n", rt->rank, e.what());
@@ -379,7 +431,7 @@ int run_workers(int argc, char** argv, const RuntimeOptions& opt, int (*worker_m
           dev::init(opt.gpu ? dev::Backend::GPU : dev::Backend::CPU, i);
           init_world_comm();
           rcs[i] = worker_main(argc, argv);
-          t_world = Comm();
+          t_world = Comm(); t_registry.clear();
           dev::finalize();
         } catch (const std::exception& e) {
           std::fprintf(stderr, "[worker %d] error: %s\n", t_worker, e.what());
