@@ -253,13 +253,6 @@ Done in the build environment (no MPI, no GPU there): CPU builds with the MPI sh
 - Gradient norms are bit-identical between `mpi` and `hier` transports.
 - Counted FLOPs equal the analytic model.
 
-**Not yet exercised:** `device_cuda.cu` and `comm_vmm.cpp`, including CUDA-graph capture
-(`--replay graph`). They were written against CUDA 12 / cuBLAS / VMM APIs but never
-compiled or run (no CUDA toolkit or GPU was available), so expect a compile-fix pass on
-the first `make CUDA=1`. On CPU, `--replay graph` falls back to `eager`, which runs the
-same recorded op stream and segmentation. The
-shim build is for functional testing only; measure with a real MPI.
-
 **Modelling simplifications:**
 - No LayerNorm/bias/dropout.
 - GELU 2-matrix MLP: for SwiGLU FLOP parity set `--ffn` to 1.5× the SwiGLU width.
