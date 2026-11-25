@@ -4,7 +4,8 @@
 Labels are "strategy|transport|nodes|workers|weak|strong" (written by scaling_cases.sh).
 For each (strategy, transport) the smallest worker count is the baseline:
   weak   efficiency = (tokens/s per worker) / (baseline tokens/s per worker)
-  strong efficiency = speedup / (workers / baseline workers),  speedup = t_base / t
+  strong efficiency = (tokens/s / baseline tokens/s) / (workers / baseline workers)
+                     (= speedup / worker ratio when the global batch is fixed)
 Also writes <csv>_summary.csv next to the input.
 usage: summarize.py scaling_gpu.csv
 """
@@ -37,7 +38,7 @@ def main(path):
             if mode == "weak":
                 eff = (x["tps"] / x["workers"]) / (b["tps"] / b["workers"])
             else:
-                eff = (b["iter"] / x["iter"]) / (x["workers"] / b["workers"])
+                eff = (x["tps"] / b["tps"]) / (x["workers"] / b["workers"])
             print(f"{x['nodes']:>5} {x['workers']:>7} {x['iter']:>9.4f} {x['tps']:>12.4g} {x['tps']/x['workers']:>10.4g} "
                   f"{100*x['mfu']:>6.2f} {100*x['comm']:>6.1f} {x['mem']:>8.0f} {100*eff:>6.1f}")
             out_rows.append([strat, tr, mode, x["nodes"], x["workers"], x["iter"], x["tps"], x["mfu"], x["comm"],

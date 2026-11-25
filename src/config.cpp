@@ -123,6 +123,8 @@ Config parse_config(int argc, char** argv) {
       {"pp-schedule", [&](auto& v) {
          if (v == "gpipe") c.schedule = PPSchedule::GPIPE; else if (v == "1f1b") c.schedule = PPSchedule::ONE_F_ONE_B;
          else fail("--pp-schedule gpipe|1f1b"); }},
+      {"pp-virtual", [&](auto& v) { c.pp_virtual = I(v); }},
+      {"timeline", [&](auto& v) { c.timeline = v; }}, {"timeline-iters", [&](auto& v) { c.timeline_iters = I(v); }},
       {"device", [&](auto& v) { if (v != "cpu" && v != "gpu") fail("--device cpu|gpu"); c.gpu = v == "gpu"; }},
       {"precision", [&](auto& v) { c.precision = parse_dtype(v); }},
       {"grad-dtype", [&](auto& v) { if (v != "fp32" && v != "compute") fail("--grad-dtype fp32|compute"); c.grad_fp32 = v == "fp32"; }},
@@ -179,7 +181,13 @@ void validate(const Config& c, int world) {
   req(c.seq % c.cp == 0, "seq must be divisible by cp");
   const long long tok = (long long)c.micro_batch * c.seq / c.cp;
   req(tok % c.tp == 0, "micro-batch*seq/cp must be divisible by tp (sequence parallel / MoE token slicing)");
-  req(c.layers >= c.pp, "need at least one layer per pipeline stage");
+  req(c.pp_virtual >= 1, "--pp-virtual must be >= 1");
+  req(c.layers >= c.pp * c.pp_virtual, "need at least one layer per (virtual) pipeline stage: layers >= pp * pp-virtual");
+  if (c.pp_virtual > 1) {
+    req(c.pp > 1, "--pp-virtual > 1 needs --pp > 1");
+    req(c.microbatches % c.pp == 0, "interleaved pipelining needs microbatches to be a multiple of pp");
+  }
+  req(c.timeline_iters >= 1, "--timeline-iters must be >= 1");
   req(c.microbatches >= 1, "need >= 1 microbatch");
   req(c.zero_stage() >= 0 && c.zero_stage() <= 3, "zero stage must be 0..3");
   if (c.experts > 0) {
@@ -210,7 +218,8 @@ router    --router uniform|zipf|local|remote|distance|node-limited|round-robin
           --router-static      reuse the same routing every iteration
 parallel  --tp --pp --dp --fsdp --cp --ep  (world = pp*dp*fsdp*cp*tp; EP folded into dp*fsdp)
           --zero 0|1|2|3 (default 3 if fsdp>1)  --sp  --overlap  --recompute
-          --pp-schedule gpipe|1f1b
+          --pp-schedule gpipe|1f1b  --pp-virtual v (interleaved: v model chunks per rank,
+                       bubble ~ (pp-1)/(v*m + pp-1); needs microbatches % pp == 0)
 device    --device cpu|gpu --precision fp32|bf16|fp16|fp64 --grad-dtype fp32|compute --tf32
           --loss-scale s --clip-grad g --lr x
 transport --transport mpi|hier  --cuda-aware 0|1  --workers-per-node n  --ranks-per-node n
@@ -218,6 +227,8 @@ transport --transport mpi|hier  --cuda-aware 0|1  --workers-per-node n  --ranks-
 run       --iters N --warmup W --seed s --peak-tflops T (0 = measure) --sync-timers 0|1
           --json file --csv file --label name --verbose
           --selftest           verify all collectives / P2P / DistMatrix redistributions and exit
+          --timeline P         Chrome/Perfetto trace of --timeline-iters measured iterations
+                       (P.json merged, P.w<k>.json per worker): pipeline ops, kernels, comm waits
 replay    --replay off|eager|graph   record the last warm-up step, then replay the measured steps
                        (graph: one CUDA graph per compute segment between communication calls)
           --trace-save P       write the recorded step to P.manifest + P.w<worker>.xpt

@@ -49,6 +49,19 @@ void end() { R.list = nullptr; }
 Trace* current() { return R.t; }
 }  // namespace trace
 
+static const char* kSpanNames[] = {"F", "B", "grad sync", "optimizer step"};
+int span_name_id(const char* name) {
+  for (int i = 0; i < int(sizeof(kSpanNames) / sizeof(kSpanNames[0])); ++i)
+    if (std::strcmp(kSpanNames[i], name) == 0) return i;
+  return -1;
+}
+const char* span_name(int id) { return kSpanNames[id]; }
+void trace_mark_span(const char* name, bool begin, int mb, int chunk) {
+  if (!trace::active()) return;
+  const int id = span_name_id(name);
+  if (id >= 0) trace::rec(TOpKind::C_MARK, {id, begin ? 1 : 0, mb, chunk});
+}
+
 long trace_mark() { return R.list ? long(R.list->size()) : -1; }
 void trace_attribute(long mark, double seconds, Cat c) {
   if (!R.list || mark < 0) return;
@@ -85,7 +98,8 @@ bool replay_safe_option(const std::string& k) {
   static const std::set<std::string> ok = {
       "iters", "warmup", "replay", "trace-save", "trace-load", "sync-timers", "sync-collectives", "json", "csv", "label",
       "verbose", "transport", "workers-per-node", "ranks-per-node", "window-mb", "cuda-aware", "gdr",
-      "allow-multi-rank-per-node", "peak-tflops", "graph-dot", "arena-mb", "device", "tf32"};
+      "allow-multi-rank-per-node", "peak-tflops", "graph-dot", "arena-mb", "device", "tf32", "timeline",
+      "timeline-iters"};
   return ok.count(k) > 0;
 }
 
@@ -207,6 +221,11 @@ Replayer::~Replayer() {
 }
 int Replayer::segments() const { return int(segs_.size()); }
 int Replayer::compute_segments() const { int n = 0; for (auto& s : segs_) n += !s.comm; return n; }
+int Replayer::markers() const {
+  int n = 0;
+  for (auto& s : segs_) n += s.comm && t_.step[s.begin].kind == TOpKind::C_MARK;
+  return n;
+}
 
 void* Replayer::P(int64_t e) const {
   if (e == -1) return nullptr;
@@ -230,6 +249,7 @@ void Replayer::run_step() {
     else for (size_t i = s.begin; i < s.end; ++i) exec(t_.step[i]);
     if (m.sync_timers && dev::is_gpu()) dev::sync();
     const double dt = now_sec() - t0;
+    timeline_event(graphs_[k] ? "graph segment" : "eager segment", Cat(s.cat_w.begin()->first), 0, t0, dt);
     if (!m.recording) continue;
     for (auto& kv : s.cat_w) { m.cat[kv.first].time += dt * kv.second; m.cat[kv.first].calls += 1; }
     m.flops_model += s.flops_m; m.flops_hw += s.flops_h;
@@ -327,6 +347,14 @@ void Replayer::exec(const TOp& op) {
                   c.alltoall_host(b.data(), o.data(), n, cat); break; }
         default: fail("trace: unknown host collective");
       }
+      break;
+    }
+    case TOpKind::C_MARK: {  // re-emit pipeline spans on the replay timeline
+      if (a[1]) { mark_t0_.push_back(now_sec()); break; }
+      if (mark_t0_.empty()) break;
+      const double t0 = mark_t0_.back(); mark_t0_.pop_back();
+      auto& m = metrics();
+      if (m.timeline.on) m.timeline.ev.push_back({span_name(int(a[0])), uint8_t(NCAT), 0, t0, now_sec() - t0, int(a[2]), int(a[3])});
       break;
     }
     default: fail("trace: unknown op kind " + std::to_string(int(op.kind)));

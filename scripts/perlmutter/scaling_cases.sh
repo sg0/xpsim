@@ -17,6 +17,9 @@
 #   tp_dp     --tp G --sp --dp n          (Megatron TP+SP inside a node)
 #   tp_pp_dp  --tp G --sp --pp 2 --dp n/2 (3-D, even n only)
 #   cp_dp     --cp G --dp n               (context parallel inside a node, long sequence)
+#   pp, pp_v2, pp_v4  --tp G --sp --pp n [--pp-virtual 2|4]: one pipeline stage per node,
+#             microbatches = multiple of n >= XP_PP_MB, model depth XP_PP_LAYERS (n >= 2);
+#             strong scaling (global batch fixed while n <= XP_PP_MB)
 #   fsdp_strong  fsdp at a fixed global batch (strong scaling)
 #   moe_ep    MoE model, --dp W --ep gcd(W, experts)
 #   moe_router   MoE at the largest n with each router locality policy
@@ -33,7 +36,7 @@ xp_default_nodes() {
 xp_scaling() {
   local G=$1
   local nodes_list=${XP_NODES:-$(xp_default_nodes)}
-  local strategies=${XP_STRATEGIES:-"dp fsdp zero1 hsdp tp_dp tp_pp_dp cp_dp fsdp_strong moe_ep moe_router"}
+  local strategies=${XP_STRATEGIES:-"dp fsdp zero1 hsdp tp_dp tp_pp_dp cp_dp pp pp_v2 pp_v4 fsdp_strong moe_ep moe_router"}
   local transports=${XP_TRANSPORTS:-"mpi hier"}
   local replays=${XP_REPLAY:-off}
   local csv="$XP_OUT/scaling_${XP_PART}.csv"
@@ -55,6 +58,11 @@ xp_scaling() {
         tp_pp_dp)    [ $((n % 2)) -eq 0 ] || continue
                      args="--tp $G --sp --pp 2 --dp $((n / 2)) --overlap --microbatches $XP_PP_MB" ;;
         cp_dp)       args="--cp $G --dp $n --overlap --microbatches $XP_MB $XP_CP_EXTRA" ;;
+        pp|pp_v2|pp_v4)
+                     local vv=1; [ "$s" = pp_v2 ] && vv=2; [ "$s" = pp_v4 ] && vv=4; mode=strong
+                     [ "$n" -ge 2 ] && [ "${XP_PP_LAYERS:-32}" -ge $((n * vv)) ] || continue
+                     local mm=$(( (XP_PP_MB + n - 1) / n * n ))
+                     args="--layers ${XP_PP_LAYERS:-32} --tp $G --sp --pp $n --pp-virtual $vv --microbatches $mm" ;;
         fsdp_strong) local per=$((XP_MICRO * W)); mode=strong
                      [ $((XP_GB % per)) -eq 0 ] && [ "$XP_GB" -ge "$per" ] || { echo "SKIP  fsdp_strong N=$n (global batch $XP_GB not divisible by $per)"; continue; }
                      args="--fsdp $W --overlap --microbatches $((XP_GB / per))" ;;

@@ -28,6 +28,9 @@ xp_test_matrix() {
   t_mpi  "TP4+SP"                       4  --preset tiny --tp 4 --sp
   t_mpi  "PP4 1f1b m4"                  4  --preset tiny --layers 4 --pp 4 --microbatches 4
   t_mpi  "PP2 gpipe"                    2  --preset tiny --pp 2 --microbatches 4 --pp-schedule gpipe
+  t_mpi  "PP4 interleaved v2 m8"        4  --preset tiny --layers 8 --pp 4 --pp-virtual 2 --microbatches 8
+  t_mpi  "PP4 interleaved v2 across nodes" 16 --preset tiny --layers 16 --tp 4 --pp 4 --pp-virtual 2 --microbatches 8
+  t_hier "PP4 interleaved v2 timeline"  16 4 --preset tiny --layers 16 --tp 4 --pp 4 --pp-virtual 2 --microbatches 8 --timeline "$XP_OUT/timeline_pp4v2"
   t_mpi  "CP4 causal"                   4  --preset tiny --cp 4
   t_mpi  "CP2 x TP2 (GQA kv=2)"         4  --preset tiny --cp 2 --tp 2 --kv-heads 2
   t_mpi  "EP4 MoE uniform"              4  --preset moe-tiny --dp 4 --ep 4
@@ -62,6 +65,7 @@ xp_test_matrix() {
   t_roundtrip "FSDP16 overlap"         16  --preset tiny --fsdp 16 --overlap
   t_roundtrip "3D TP2 PP2 DP4 bf16"    16  --preset tiny --tp 2 --pp 2 --dp 4 --microbatches 4 --precision bf16
   t_roundtrip "MoE TP2+SP EP4 FSDP2"   16  --preset moe-tiny --tp 2 --sp --fsdp 2 --dp 4 --ep 4
+  t_roundtrip "TP4 PP4 v2 interleaved" 16  --preset tiny --layers 16 --tp 4 --pp 4 --pp-virtual 2 --microbatches 8
 }
 
 # Save a trace (mpi transport, in-process replay), rebuild + replay it in new jobs on

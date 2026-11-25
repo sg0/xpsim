@@ -35,6 +35,10 @@ run 4 "TP4"                     --preset tiny --tp 4
 run 4 "TP4+SP"                  --preset tiny --tp 4 --sp
 run 4 "PP4 1f1b m4"             --preset tiny --layers 4 --pp 4 --microbatches 4
 run 2 "PP2 gpipe"               --preset tiny --pp 2 --microbatches 4 --pp-schedule gpipe
+run 4 "PP4 interleaved v2 m8"        --preset tiny --layers 8 --pp 4 --pp-virtual 2 --microbatches 8
+run 2 "PP2 interleaved v4 gpipe"      --preset tiny --layers 8 --pp 2 --pp-virtual 4 --microbatches 4 --pp-schedule gpipe
+run 8 "TP2 SP PP2v2 DP2 rc bf16"      --preset tiny --layers 8 --tp 2 --sp --pp 2 --pp-virtual 2 --dp 2 --microbatches 4 --recompute --precision bf16
+run 4 "timeline PP4v2"                --preset tiny --layers 8 --pp 4 --pp-virtual 2 --microbatches 4 --timeline ${TMPDIR:-/tmp}/xpsim-tl-test
 run 4 "CP4 causal"              --preset tiny --cp 4
 run 4 "CP2 x TP2 (GQA kv=2)"    --preset tiny --cp 2 --tp 2 --kv-heads 2
 run 4 "EP4 MoE uniform"         --preset moe-tiny --dp 4 --ep 4
@@ -69,6 +73,16 @@ rt "PP4 1f1b"               "replay PP4" 4 --preset tiny --layers 4 --pp 4 --mic
 rt "MoE TP2+SP+EP2 FSDP"    "replay MoE" 4 --preset moe-tiny --tp 2 --sp --fsdp 2 --ep 2
 rt "4D rc bf16"             "replay 4D" 8 --preset tiny --tp 2 --sp --pp 2 --fsdp 2 --recompute --microbatches 3 --precision bf16
 rt "fp16 loss scale"        "replay fp16" 4 --preset tiny --fsdp 4 --precision fp16 --grad-dtype compute
+rt "interleaved PP4 v2"     "replay PP4v2" 4 --preset tiny --layers 8 --pp 4 --pp-virtual 2 --microbatches 4
 rt "hier EP4 local"         "replay hier EP4" 2 --preset moe-tiny --dp 4 --ep 4 --router local --transport hier --workers-per-node 2
+# interleaving must not change the math: same grad norms for pp=1 and pp=4 v=2
+inv() {
+  local a b
+  a=$(timeout 300 $BIN -np 1 $COMMON --verbose --preset tiny --layers 8 --microbatches 4 2>&1 | grep grad-norm | sed 's/.*grad-norm \([^ ]*\).*/\1/' | tr '\n' ' ')
+  b=$(timeout 300 $BIN -np 4 $COMMON --verbose --preset tiny --layers 8 --microbatches 4 --pp 4 --pp-virtual 2 2>&1 | grep grad-norm | sed 's/.*grad-norm \([^ ]*\).*/\1/' | tr '\n' ' ')
+  if [ -n "$a" ] && [ "$a" = "$b" ]; then printf "PASS  %-34s %s\n" "invariance pp1 == pp4 v2" "$b"; pass=$((pass+1))
+  else printf "FAIL  %-34s pp1 [%s] pp4v2 [%s]\n" "invariance pp1 == pp4 v2" "$a" "$b"; fail=$((fail+1)); fi
+}
+[ -z "$LAUNCH" ] && inv
 echo "----"; echo "passed $pass, failed $fail"
 [ $fail -eq 0 ]

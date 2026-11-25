@@ -113,7 +113,9 @@ static Request post_op(CommImpl& impl, const OpDesc& op, Cat cat) {
   Request r{impl.post(op)};
   r.s->cat = cat;
   r.s->trace_id = tid;
-  if (m.recording) { m.cat[int(cat)].time += now_sec() - t0; m.cat[int(cat)].calls += 1; }
+  const double t1 = now_sec();
+  timeline_event(cat_name(cat), cat, 'p', t0, t1 - t0);
+  if (m.recording) { m.cat[int(cat)].time += t1 - t0; m.cat[int(cat)].calls += 1; }
   return r;
 }
 void Comm::wait(Request& r) {
@@ -124,7 +126,9 @@ void Comm::wait(Request& r) {
   impl_->wait(*r.s);
   r.s->waited = true;
   auto& m = metrics();
-  if (m.recording) m.cat[int(r.s->cat)].time += now_sec() - t0;
+  const double t1 = now_sec();
+  timeline_event(cat_name(r.s->cat), r.s->cat, 'w', t0, t1 - t0);
+  if (m.recording) m.cat[int(r.s->cat)].time += t1 - t0;
   r.s.reset();
 }
 void Comm::waitall(std::vector<Request>& rs) { for (auto& r : rs) wait(r); rs.clear(); }

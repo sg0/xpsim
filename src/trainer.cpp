@@ -24,10 +24,12 @@
 #include "xpsim/moe_router.hpp"
 #include "xpsim/trace.hpp"
 #include <functional>
+#include <tuple>
 
 namespace xpsim {
 
 void report(const Config& cfg, const ProcessGrid& g, double peak_tflops, const ModelCounts& mc);  // report.cpp
+void write_timeline(const Config& cfg, const ProcessGrid& g);                                      // timeline.cpp
 
 ModelCounts model_counts(const Config& c) {
   ModelCounts m;
@@ -67,15 +69,22 @@ class Trainer {
     m_ = cfg.microbatches;
     if (E_ > 0) router_ = std::make_unique<Router>(cfg, g);
 
-    // layer -> stage assignment (first stages take the remainder)
-    const int base = cfg.layers / cfg.pp, extra = cfg.layers % cfg.pp;
-    l0_ = 0;
-    for (int s = 0; s < g.me.pp; ++s) l0_ += base + (s < extra);
-    nl_ = base + (g.me.pp < extra);
+    // layer -> virtual stage assignment. With --pp-virtual v the model is cut into
+    // S = pp*v virtual stages (first ones take the remainder); rank r owns virtual
+    // stages r, r+pp, r+2pp, ... as its v chunks (Megatron interleaved layout).
+    v_ = std::max(1, cfg.pp_virtual); P_ = cfg.pp;
+    const int S = P_ * v_, base = cfg.layers / S, extra = cfg.layers % S;
+    for (int c = 0; c < v_; ++c) {
+      const int vs = c * P_ + g.me.pp;
+      const int start = vs * base + std::min(vs, extra), n = base + (vs < extra);
+      chunk_b_.push_back(int(gl_.size())); chunk_n_.push_back(n);
+      for (int L = start; L < start + n; ++L) gl_.push_back(L);
+    }
+    nl_ = int(gl_.size());
     const int zero = cfg.zero_stage();
     Comm* outer = &g_.hsdp;
     for (int j = 0; j < nl_; ++j) {
-      const int L = l0_ + j;
+      const int L = gl_[j];
       auto P = std::make_unique<FP>("layer" + std::to_string(L), zero, g_.fsdpGrid.get(), outer, &g_.dp, dense_cats(), cfg.overlap);
       P->add("Wqkv", h_, wqkv_); P->add("Wo", nq_ * dh_, h_);
       if (cfg.is_moe_layer(L)) P->add("Wg", h_, E_);
@@ -98,7 +107,7 @@ class Trainer {
       head_ = std::make_unique<FP>("lm_head", zero, g_.fsdpGrid.get(), outer, &g_.dp, dense_cats(), cfg.overlap);
       head_->add("Wout", h_, V_); head_->finalize(cfg.seed + 3 + g.me.t, 0.02f);
     }
-    mb_.resize(m_);
+    mb_.resize(size_t(m_) * v_);
     { dev::MemScope ms("optimizer"); opt_ = static_cast<dev::OptState*>(dev::alloc(sizeof(dev::OptState))); }
     dev::memset_zero(opt_, sizeof(dev::OptState));
   }
@@ -362,7 +371,7 @@ class Trainer {
   // ---------------- one transformer layer ----------------
   Matrix<T> fwd_layer(int j, int mb, int iter, LayerCache& c) {
     FP& D = *dense_[j];
-    const int L = l0_ + j;
+    const int L = gl_[j];
     if (cfg_.sp) gather_tp(c.X, c.Xg);
     const Matrix<T>& Xg = cfg_.sp ? c.Xg : c.X;
     c.QKV = act(T_l_, wqkv_);
@@ -506,56 +515,109 @@ class Trainer {
   }
   void release_layer(int j) { dense_[j]->release(); if (expert_[j]) expert_[j]->release(); }
 
-  void forward(int iter, int mb) {
-    MbState& st = mb_[mb];
-    st.lc.clear(); st.lc.resize(nl_);
-    if (g_.first_stage()) st.lc[0].X = embed_fwd(iter, mb, st);
+  // ---- virtual-stage topology (v = 1: plain pipeline) ----
+  bool first_vs(int c) const { return g_.me.pp == 0 && c == 0; }
+  bool last_vs(int c) const { return g_.me.pp == P_ - 1 && c == v_ - 1; }
+  MbState& state(int mb, int c) { return mb_[size_t(mb) * v_ + c]; }
+  // Tags name the *receiving* (microbatch, chunk); v = 1 gives the original 2*mb (+1).
+  int tag_fwd(int mb, int c) const { return 2 * (mb * v_ + c); }
+  int tag_bwd(int mb, int c) const { return 2 * (mb * v_ + c) + 1; }
+  // next / previous virtual stage of my chunk c: (rank, chunk); the last rank wraps to rank 0
+  std::pair<int, int> next_vs(int c) const { return g_.me.pp < P_ - 1 ? std::make_pair(g_.me.pp + 1, c) : std::make_pair(0, c + 1); }
+  std::pair<int, int> prev_vs(int c) const { return g_.me.pp > 0 ? std::make_pair(g_.me.pp - 1, c) : std::make_pair(P_ - 1, c - 1); }
+
+  void forward(int iter, int mb, int c) {
+    TimelineSpan span("F", Cat::GEMM_FWD, mb, c);
+    MbState& st = state(mb, c);
+    const int cb = chunk_b_[c], cn = chunk_n_[c];
+    st.lc.clear(); st.lc.resize(cn);
+    Matrix<T> x;
+    if (first_vs(c)) x = embed_fwd(iter, mb, st);
     else {
       g_.pp.wait(st.act_req);  // includes pipeline-bubble wait
-      st.lc[0].X = std::move(st.act_in);
+      x = std::move(st.act_in);
     }
-    if (nl_ > 0) gather_layer(0, false);
-    for (int j = 0; j < nl_; ++j) {
-      if (cfg_.overlap && j + 1 < nl_) gather_layer(j + 1, true);  // FSDP prefetch
-      Matrix<T> out = fwd_layer(j, mb, iter, st.lc[j]);
+    if (cn > 0) { st.lc[0].X = std::move(x); gather_layer(cb, false); }
+    else st.out = std::move(x);  // empty chunk: pass through
+    for (int jj = 0; jj < cn; ++jj) {
+      const int j = cb + jj;
+      if (cfg_.overlap && jj + 1 < cn) gather_layer(j + 1, true);  // FSDP prefetch
+      Matrix<T> out = fwd_layer(j, mb, iter, st.lc[jj]);
       release_layer(j);
-      if (cfg_.recompute) { Matrix<T> keep = std::move(st.lc[j].X); st.lc[j] = LayerCache{}; st.lc[j].X = std::move(keep); }
-      if (j + 1 < nl_) st.lc[j + 1].X = std::move(out);
+      if (cfg_.recompute) { Matrix<T> keep = std::move(st.lc[jj].X); st.lc[jj] = LayerCache{}; st.lc[jj].X = std::move(keep); }
+      if (jj + 1 < cn) st.lc[jj + 1].X = std::move(out);
       else st.out = std::move(out);
-      if (!cfg_.overlap && j + 1 < nl_) gather_layer(j + 1, false);
+      if (!cfg_.overlap && jj + 1 < cn) gather_layer(j + 1, false);
     }
-    if (g_.last_stage()) { head_fwd(iter, mb, st, st.out); st.out.Empty(); }
-    else st.send_req = g_.pp.isend(st.out.LockedBuffer(), st.out.Bytes(), g_.me.pp + 1, 2 * mb, Cat::PP_P2P);
+    if (last_vs(c)) { head_fwd(iter, mb, st, st.out); st.out.Empty(); }
+    else {
+      auto [r, nc] = next_vs(c);
+      st.send_req = g_.pp.isend(st.out.LockedBuffer(), st.out.Bytes(), r, tag_fwd(mb, nc), Cat::PP_P2P);
+    }
   }
 
-  void backward(int iter, int mb) {
-    MbState& st = mb_[mb];
-    const bool last = mb == m_ - 1;
+  void backward(int iter, int mb, int c) {
+    TimelineSpan span("B", Cat::GEMM_BWD, mb, c);
+    MbState& st = state(mb, c);
+    const int cb = chunk_b_[c], cn = chunk_n_[c];
+    const bool last = mb == m_ - 1;  // last backward of this chunk in every schedule
     Matrix<T> dOut;
-    if (g_.last_stage()) { dOut = head_bwd(st); head_->reduce_grads(last); }
+    if (last_vs(c)) { dOut = head_bwd(st); head_->reduce_grads(last); }
     else { g_.pp.wait(st.grad_req); dOut = std::move(st.grad_in); }
-    if (nl_ > 0) gather_layer(nl_ - 1, false);
-    for (int j = nl_ - 1; j >= 0; --j) {
-      if (cfg_.overlap && j > 0) gather_layer(j - 1, true);
+    if (cn > 0) gather_layer(cb + cn - 1, false);
+    for (int jj = cn - 1; jj >= 0; --jj) {
+      const int j = cb + jj;
+      if (cfg_.overlap && jj > 0) gather_layer(j - 1, true);
       dense_[j]->begin_backward(); if (expert_[j]) expert_[j]->begin_backward();
-      LayerCache& c = st.lc[j];
+      LayerCache& lcj = st.lc[jj];
       if (cfg_.recompute) {
         metrics().in_recompute = true;
-        Matrix<T> discard = fwd_layer(j, mb, iter, c);
+        Matrix<T> discard = fwd_layer(j, mb, iter, lcj);
         metrics().in_recompute = false;
       }
-      Matrix<T> dX = bwd_layer(j, c, dOut);
-      st.lc[j] = LayerCache{};
+      Matrix<T> dX = bwd_layer(j, lcj, dOut);
+      st.lc[jj] = LayerCache{};
       release_layer(j);
       dense_[j]->reduce_grads(last); if (expert_[j]) expert_[j]->reduce_grads(last);
       dOut = std::move(dX);
-      if (!cfg_.overlap && j > 0) gather_layer(j - 1, false);
+      if (!cfg_.overlap && jj > 0) gather_layer(j - 1, false);
     }
-    if (g_.first_stage()) { embed_bwd(st, dOut); embed_->reduce_grads(last); }
+    if (first_vs(c)) { embed_bwd(st, dOut); embed_->reduce_grads(last); }
     else {
       st.dx_send = std::move(dOut);
-      st.send_req = g_.pp.isend(st.dx_send.LockedBuffer(), st.dx_send.Bytes(), g_.me.pp - 1, 2 * mb + 1, Cat::PP_P2P);
+      auto [r, pc] = prev_vs(c);
+      st.send_req = g_.pp.isend(st.dx_send.LockedBuffer(), st.dx_send.Bytes(), r, tag_bwd(mb, pc), Cat::PP_P2P);
     }
+  }
+
+  // Pipeline schedule of this rank: (forward?, microbatch, chunk).
+  //  v = 1 : GPipe, or 1F1B with p-r-1 warm-up forwards.
+  //  v > 1 : interleaved 1F1B (Megatron): N = m*v virtual microbatches; virtual
+  //          microbatch k runs chunk (k mod p*v)/p (reversed for backward) of
+  //          microbatch (k / p*v)*p + k mod p; warm-up (p-r-1)*2 + (v-1)*p.
+  //          Bubble ~ (p-1)/(v*m + p-1) instead of (p-1)/(m + p-1).
+  std::vector<std::tuple<bool, int, int>> schedule() const {
+    const int P = P_, v = v_, m = m_, r = g_.me.pp, N = m * v;
+    auto fmap = [&](int k, bool fwd) {
+      int c = (k % (P * v)) / P;
+      return std::make_tuple(fwd, (k / (P * v)) * P + k % P, fwd ? c : v - 1 - c);
+    };
+    std::vector<std::tuple<bool, int, int>> ops;
+    if (cfg_.schedule == PPSchedule::GPIPE || P == 1) {
+      for (int k = 0; k < N; ++k) ops.push_back(fmap(k, true));
+      for (int k = 0; k < N; ++k) ops.push_back(fmap(k, false));
+    } else if (v == 1) {
+      const int warm = std::min(P - r - 1, m);
+      for (int i = 0; i < warm; ++i) ops.push_back({true, i, 0});
+      for (int i = 0; i < m - warm; ++i) { ops.push_back({true, warm + i, 0}); ops.push_back({false, i, 0}); }
+      for (int i = m - warm; i < m; ++i) ops.push_back({false, i, 0});
+    } else {
+      const int warm = m == P ? N : std::min((P - r - 1) * 2 + (v - 1) * P, N);
+      for (int k = 0; k < warm; ++k) ops.push_back(fmap(k, true));
+      for (int i = 0; i < N - warm; ++i) { ops.push_back(fmap(warm + i, true)); ops.push_back(fmap(i, false)); }
+      for (int k = N - warm; k < N; ++k) ops.push_back(fmap(k, false));
+    }
+    return ops;
   }
 
   std::vector<FP*> all_params() {
@@ -570,28 +632,22 @@ class Trainer {
     auto params = all_params();
     for (auto* p : params) p->zero_grads();
     const size_t bytes = size_t(rows_) * h_ * sizeof(T);
-    for (int mb = 0; mb < m_; ++mb) {  // pre-post all pipeline receives
-      MbState& st = mb_[mb];
-      if (!g_.first_stage()) { st.act_in = act(rows_, h_); st.act_req = g_.pp.irecv(st.act_in.Buffer(), bytes, g_.me.pp - 1, 2 * mb, Cat::PP_P2P); }
-      if (!g_.last_stage()) { st.grad_in = act(rows_, h_); st.grad_req = g_.pp.irecv(st.grad_in.Buffer(), bytes, g_.me.pp + 1, 2 * mb + 1, Cat::PP_P2P); }
-    }
-    // schedule
-    std::vector<std::pair<bool, int>> ops;
-    if (cfg_.schedule == PPSchedule::GPIPE || cfg_.pp == 1) {
-      for (int mb = 0; mb < m_; ++mb) ops.push_back({true, mb});
-      for (int mb = 0; mb < m_; ++mb) ops.push_back({false, mb});
-    } else {
-      const int warm = std::min(cfg_.pp - g_.me.pp - 1, m_);
-      for (int i = 0; i < warm; ++i) ops.push_back({true, i});
-      for (int i = 0; i < m_ - warm; ++i) { ops.push_back({true, warm + i}); ops.push_back({false, i}); }
-      for (int i = m_ - warm; i < m_; ++i) ops.push_back({false, i});
-    }
+    for (int mb = 0; mb < m_; ++mb)  // pre-post all pipeline receives (deadlock-free with any schedule)
+      for (int c = 0; c < v_; ++c) {
+        MbState& st = state(mb, c);
+        if (!first_vs(c)) { st.act_in = act(rows_, h_); st.act_req = g_.pp.irecv(st.act_in.Buffer(), bytes, prev_vs(c).first, tag_fwd(mb, c), Cat::PP_P2P); }
+        if (!last_vs(c)) { st.grad_in = act(rows_, h_); st.grad_req = g_.pp.irecv(st.grad_in.Buffer(), bytes, next_vs(c).first, tag_bwd(mb, c), Cat::PP_P2P); }
+      }
     std::vector<Request> sends;
-    for (auto& [fwd, mb] : ops) {
-      if (fwd) forward(iter, mb); else backward(iter, mb);
-      if (mb_[mb].send_req.active()) sends.push_back(std::move(mb_[mb].send_req));
+    for (auto& [fwd, mb, c] : schedule()) {
+      if (fwd) forward(iter, mb, c); else backward(iter, mb, c);
+      if (state(mb, c).send_req.active()) sends.push_back(std::move(state(mb, c).send_req));
     }
-    for (auto* p : params) p->finish_reductions();
+    {
+      TimelineSpan span("grad sync", Cat::DP_AR);
+      for (auto* p : params) p->finish_reductions();
+    }
+    TimelineSpan ospan("optimizer step", Cat::OPTIMIZER);
     // global gradient norm, clipping and fp16 overflow skip: all device-resident
     double* norm2 = reinterpret_cast<double*>(opt_);  // OptState::norm2 is the first member
     dev::memset_zero(norm2, sizeof(double));
@@ -609,7 +665,9 @@ class Trainer {
   std::unique_ptr<Router> router_;
   int h_, dh_, tp_, cp_, nq_, nkv_, grp_, wqkv_, kvw_, ffn_, V_, b_, E_, el_, effn_, m_;
   Int s_l_, T_l_, Ts_, rows_, s_k_;
-  int l0_ = 0, nl_ = 0;
+  int nl_ = 0, v_ = 1, P_ = 1;
+  std::vector<int> gl_;                // global layer id of each local layer
+  std::vector<int> chunk_b_, chunk_n_; // local layers of each chunk: [b, b+n)
   dev::OptState* opt_ = nullptr;
   std::vector<std::unique_ptr<FP>> dense_, expert_;
   std::vector<bool> moe_;
@@ -635,17 +693,23 @@ void run_loop(const Config& cfg, const std::function<void(int)>& step, const std
   auto& world = Comm::world();
   const int total = cfg.warmup + cfg.iters;
   int skip0 = 0;
+  const int tl_end = cfg.warmup + std::max(1, cfg.timeline_iters);
   for (int it = 0; it < total; ++it) {
     world.barrier();
     m.recording = it >= cfg.warmup;
+    m.timeline.on = !cfg.timeline.empty() && it >= cfg.warmup && it < tl_end;
+    if (m.timeline.on && it == cfg.warmup) m.timeline.epoch = now_sec();  // common origin right after the barrier
     if (it == cfg.warmup) {
       if (m.replay.mode == "live") dev::mem_reset_peak();  // replay allocates nothing: keep the recorded step's peak
       skip0 = read_opt(opt()).skipped_total;
     }
     if (dev::is_gpu()) dev::sync();
     const double t0 = now_sec();
-    step(it);
-    if (dev::is_gpu()) dev::sync();
+    {
+      TimelineSpan span("iteration", Cat::MISC_COMM, it - cfg.warmup);
+      step(it);
+      if (dev::is_gpu()) dev::sync();
+    }
     const double dt = now_sec() - t0;
     if (m.recording) m.iter_times.push_back(dt);
     if (cfg.verbose) {
@@ -657,6 +721,7 @@ void run_loop(const Config& cfg, const std::function<void(int)>& step, const std
   }
   m.skipped_steps = read_opt(opt()).skipped_total - skip0;
   m.recording = false;
+  m.timeline.on = false;
   world.barrier();
 }
 
@@ -666,7 +731,7 @@ Replayer::Mode replay_mode(const Config& cfg) {
 void set_replay_info(const Replayer& r, const Trace& t, const std::string& source, int trace_iter) {
   auto& ri = metrics().replay;
   ri.mode = r.mode() == Replayer::Mode::GRAPH ? "graph" : "eager";
-  ri.ops = double(t.step.size()); ri.segments = r.segments(); ri.compute_segments = r.compute_segments();
+  ri.ops = double(t.step.size()); ri.segments = r.segments() - r.markers(); ri.compute_segments = r.compute_segments();
   ri.graphs = r.graphs(); ri.build_s = r.build_seconds(); ri.source = source; ri.trace_iter = trace_iter;
 }
 size_t arena_bytes(const Config& cfg, size_t at_least) {
@@ -739,6 +804,7 @@ int train_t(const Config& cfg) {
       }
     }, [&] { return tr.opt_state(); });
     rp.reset();
+    write_timeline(cfg, g);
     report(cfg, g, peak, model_counts(cfg));
   }
   if (tracing) dev::arena_end();
@@ -776,6 +842,7 @@ int replay_file(const Config& cfg) {
     for (auto& mp : t.mem_peak) dev::mem_note_peak(mp.first, size_t(mp.second));
     dev::OptState* opt = t.opt_state >= 0 ? reinterpret_cast<dev::OptState*>(dev::arena_base() + t.opt_state) : nullptr;
     run_loop(cfg, [&](int) { rp.run_step(); }, [&] { return opt; });
+    write_timeline(cfg, g);
     report(cfg, g, peak, model_counts(cfg));
   }
   dev::arena_end();

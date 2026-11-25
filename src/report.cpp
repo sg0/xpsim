@@ -162,15 +162,22 @@ void report(const Config& cfg, const ProcessGrid& g, double peak, const ModelCou
   o << "comm volume / worker / iter: " << mib(vb) << " MiB  (intra-node " << mib(vi) << " MiB, inter-node " << mib(vx) << " MiB)\n";
 
   if (cfg.pp > 1) {
-    const double mth = double(cfg.pp - 1) / (cfg.microbatches + cfg.pp - 1);
+    const int p = cfg.pp, v = cfg.pp_virtual, mb = cfg.microbatches;
+    const double mth = double(p - 1) / (double(v) * mb + p - 1), m1 = double(p - 1) / (mb + p - 1);
+    const Row& pr = rows[int(Cat::PP_P2P)];
     o << "\n---- pipeline ------------------------------------------------------------------\n";
-    o << "theoretical bubble (p-1)/(m+p-1): " << fmt("%.1f", 100 * mth) << " %\n";
-    for (int s = 0; s < cfg.pp; ++s) {
+    o << "schedule: " << (cfg.schedule == PPSchedule::GPIPE ? "GPipe" : (v > 1 ? "interleaved 1F1B" : "1F1B")) << ", p=" << p
+      << " stages x v=" << v << " chunk(s) = " << p * v << " virtual stages, m=" << mb << " microbatches\n";
+    o << "theoretical bubble (p-1)/(v*m+p-1): " << fmt("%.1f", 100 * mth) << " %";
+    if (v > 1) o << "  (non-interleaved: " << fmt("%.1f", 100 * m1) << " %)";
+    o << "\np2p per worker per iteration: " << fmt("%.0f", pr.calls) << " send/recv posts, " << mib(pr.bytes) << " MiB sent, "
+      << fmt("%.2f", 1e3 * pr.tmean) << " ms exposed (transfer + bubble wait)\n";
+    for (int st = 0; st < p; ++st) {
       double t = 0, cpt = 0; int k = 0;
-      for (int w = 0; w < W; ++w) if (int(at(w, OFF_COORD)) == s) {
+      for (int w = 0; w < W; ++w) if (int(at(w, OFF_COORD)) == st) {
         t += at(w, OFF_CAT + 6 * int(Cat::PP_P2P)) / iters; cpt += comp[w]; ++k; }
-      o << "  stage " << s << ": p2p+bubble wait " << fmt("%.2f", 1e3 * t / k) << " ms (" << fmt("%.1f", 100 * t / k / t_mean)
-        << " %), compute " << fmt("%.2f", 1e3 * cpt / k) << " ms\n";
+      o << "  stage " << st << ": p2p+bubble wait " << fmt("%.2f", 1e3 * t / k) << " ms (" << fmt("%.1f", 100 * t / k / t_mean)
+        << " %), compute " << fmt("%.2f", 1e3 * cpt / k) << " ms (busy " << fmt("%.1f", 100 * cpt / k / t_mean) << " %)\n";
     }
   }
   if (cfg.experts > 0) {
@@ -209,7 +216,7 @@ void report(const Config& cfg, const ProcessGrid& g, double peak, const ModelCou
     j << "{\n  \"label\": \"" << cfg.label << "\",\n  \"workers\": " << W << ", \"nodes\": " << num_nodes()
       << ",\n  \"config\": {\"tp\": " << cfg.tp << ", \"pp\": " << cfg.pp << ", \"dp\": " << cfg.dp << ", \"fsdp\": " << cfg.fsdp
       << ", \"cp\": " << cfg.cp << ", \"ep\": " << cfg.ep << ", \"zero\": " << cfg.zero_stage() << ", \"sp\": " << cfg.sp
-      << ", \"overlap\": " << cfg.overlap << ", \"recompute\": " << cfg.recompute << ", \"precision\": \"" << dtype_name(cfg.precision)
+      << ", \"pp_virtual\": " << cfg.pp_virtual << ", \"microbatches\": " << cfg.microbatches << ", \"overlap\": " << cfg.overlap << ", \"recompute\": " << cfg.recompute << ", \"precision\": \"" << dtype_name(cfg.precision)
       << "\", \"device\": \"" << (cfg.gpu ? "gpu" : "cpu") << "\", \"transport\": \"" << (cfg.rt.transport == Transport::MPI ? "mpi" : "hier")
       << "\", \"router\": \"" << router_name(cfg.router) << "\", \"layers\": " << cfg.layers << ", \"hidden\": " << cfg.hidden
       << ", \"seq\": " << cfg.seq << ", \"experts\": " << cfg.experts << ", \"global_batch\": " << cfg.global_batch() << "},\n";

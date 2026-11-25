@@ -51,6 +51,7 @@ override with `--layers --hidden --heads --kv-heads (GQA) --ffn --seq --vocab --
 |---|---|
 | `--tp N [--sp]` | Megatron tensor parallel (column/row-parallel QKV, out-proj, MLP; vocab-parallel embedding/head); `--sp` = sequence parallel (all-gather / reduce-scatter instead of all-reduce) |
 | `--pp N --pp-schedule 1f1b\|gpipe --microbatches m` | pipeline parallel; layers split over stages |
+| `--pp-virtual v` | interleaved pipeline (Megatron virtual stages): each rank holds `v` non-adjacent layer chunks; bubble ≈ (p−1)/(v·m+p−1); needs `m % p == 0` (see §5) |
 | `--dp N` | data-parallel *replicate* dimension |
 | `--fsdp N --zero 0..3` | data-parallel *shard* dimension; ZeRO stage (default 3 if fsdp>1). `--dp 2 --fsdp 4` = HSDP |
 | `--cp N` | context parallel: sequence split, K/V all-gathered, dK/dV reduce-scattered; causal mask with global positions |
@@ -101,6 +102,9 @@ scaling, both transports) are in `scripts/perlmutter/` (see its README).
 **Replay.** `--replay off|eager|graph`, `--trace-save P`, `--trace-load P`, `--graph-dot P`,
 `--arena-mb MB`: record one step and replay it as CUDA graphs, in-process or later from a
 file (see §4).
+
+**Timeline.** `--timeline P [--timeline-iters k]` writes a Chrome/Perfetto trace of `k`
+measured iterations (see §5).
 
 **Output.** `--json f`, `--csv f` (appends one row: ideal for sweeps, see
 `scripts/sweep.sh`), `--label`, `--verbose` (per-iteration times and grad norm),
@@ -197,7 +201,67 @@ for 7 configurations (TP+SP, FSDP, PP, MoE, 4-D with recompute in bf16, fp16 wit
 scaling, hier transport).
 
 ---------------------------------------------------------------------------------
-## 5. Code map (Elemental-style matrices)
+## 5. Pipeline schedules, bubbles and timelines
+
+**Schedules.**
+
+| schedule | options | warm-up forwards on rank r | bubble (equal F/B cost) |
+|---|---|---|---|
+| GPipe | `--pp-schedule gpipe` | all `m` | (p−1)/(m+p−1) |
+| 1F1B | default | `p−r−1` | (p−1)/(m+p−1), less activation memory |
+| interleaved 1F1B | `--pp-virtual v` | `(p−r−1)·2 + (v−1)·p` (all if `m = p`) | (p−1)/(v·m+p−1) |
+
+With `--pp-virtual v` the model is cut into `p·v` virtual stages and rank `r` owns
+stages `r, r+p, r+2p, …`, so each microbatch crosses every rank `v` times. The cost is
+`v`× more pipeline messages (each the same size: one activation per microbatch hop),
+including the wrap-around from the last rank back to rank 0, and more activations in
+flight during warm-up. `--pp-virtual v --pp-schedule gpipe` runs the interleaved order
+without the 1F1B steady state.
+
+Requirements:
+- `layers >= p·v` (uneven splits give the first virtual stages one extra layer);
+- `m % p == 0` (as in Megatron).
+
+Message tags carry the receiving chunk, so any (p, v, m) mix is deadlock-free: all
+receives are pre-posted, and the schedules were checked in a dependency simulation for
+p ≤ 8, v ≤ 4, m ≤ 4p.
+
+Interleaving changes where layers run, not what is computed. The same model gives
+**bit-identical gradient norms** for pp=1, pp=2/4 and every v; `make test` checks this.
+
+**What the report shows** (pipeline section): the schedule, p × v virtual stages and m;
+the theoretical bubble, with the non-interleaved value alongside; P2P posts and bytes per
+iteration; and per stage the measured P2P+bubble wait and compute (busy %).
+
+**Timeline.** `--timeline P` records `--timeline-iters` measured iterations (default 1):
+- `P.w<k>.json` per worker, and `P.json` merged by worker 0 (shared file system);
+- open them in https://ui.perfetto.dev or chrome://tracing;
+- one track per worker, named `w<k> pp<s> tp<t> cp<c> dp<r>/<s>` and sorted by pipeline
+  stage, so the bubbles line up.
+
+Events:
+- `F mb3 c1` / `B …` spans per microbatch and chunk;
+- every timed compute region (GEMMs, attention, elementwise, MoE routing, optimizer);
+- communication `post` and `(wait)` intervals (exposed time) per category;
+- `grad sync`, `optimizer step` and one span per iteration.
+
+The timeline also works with `--replay`: pipeline spans are stored in the trace as
+markers, so a CUDA-graph replay shows the same F/B structure.
+
+```bash
+mpirun -np 16 ./bin/xpsim --preset gpt3-1.3b --layers 32 --tp 4 --pp 4 --microbatches 8 --timeline tl/v1
+mpirun -np 16 ./bin/xpsim --preset gpt3-1.3b --layers 32 --tp 4 --pp 4 --pp-virtual 2 --microbatches 8 --timeline tl/v2
+python3 scripts/timeline_gantt.py tl/v1.json tl/v2.json --labels "1F1B" "interleaved v=2" --out pp.png --csv stages.csv
+```
+
+`scripts/timeline_gantt.py` draws the schedules on one time axis. Blue is forward, orange
+backward, teal is pipeline send/recv wait; idle space is the bubble. It also prints and
+optionally writes per-worker F/B/wait times and busy/idle %. On Perlmutter,
+`pp_bubble_gpu.sbatch` / `pp_bubble_cpu.sbatch` sweep v × m × schedule (× replay) at a
+fixed node count and tabulate measured against theoretical bubble (`scripts/perlmutter/README.md`).
+
+---------------------------------------------------------------------------------
+## 6. Code map (Elemental-style matrices)
 
 | file | content |
 |---|---|
@@ -205,12 +269,13 @@ scaling, hier transport).
 | `include/xpsim/dist_matrix.hpp` | `DistGrid` (El::Grid: MC/MR/VC comms) and `DistMatrix<T,U,V>` with `U,V ∈ {MC,MR,VC,STAR}` (block distribution). `Copy` = AllGather / local filter, `Contract` = ReduceScatter, `AllReduce` |
 | `include/xpsim/flat_param.hpp` | FSDP flat parameter: ZeRO 0-3, HSDP, prefetch, async reduce-scatter/all-reduce, AdamW on the master shard |
 | `include/xpsim/grid.hpp`, `src/grid.cpp` | 5-D process grid and all groups (tp, cp, fsdp, hsdp, dp, pp, ep, edp) |
-| `src/trainer.cpp` | transformer layers (GQA attention, CP, TP/SP, MLP / MoE), embedding/LM head, 1F1B/GPipe schedules, step |
+| `src/trainer.cpp` | transformer layers (GQA attention, CP, TP/SP, MLP / MoE), embedding/LM head, GPipe / 1F1B / interleaved 1F1B schedules, step |
 | `include/xpsim/moe_router.hpp`, `src/moe_router.cpp` | locality-aware MoE router |
 | `include/xpsim/comm.hpp`, `src/comm.cpp`, `src/comm_hier.cpp`, `src/comm_vmm.cpp` | worker-level `Comm`, MPI transport, hierarchical engine, VMM windows |
 | `include/xpsim/device.hpp`, `src/device*.{cpp,cu}` | backend: CPU (OpenMP blocked GEMM or CBLAS) and CUDA (cuBLAS GemmEx + kernels); allocation tracking |
 | `src/metrics.cpp`, `src/report.cpp` | counters and report |
 | `include/xpsim/trace.hpp`, `src/trace.cpp` | trace recording, file format, replayer (eager / CUDA graphs) |
+| `src/timeline.cpp`, `scripts/timeline_gantt.py` | Chrome/Perfetto timeline export; pipeline Gantt chart + per-stage bubble table |
 | `src/selftest.cpp` | transport / redistribution verification |
 | `tools/mpishim` | thread-based MPI subset for testing without MPI |
 
@@ -223,7 +288,7 @@ scaling, hier transport).
   16-bit operands are widened to fp32.
 
 ---------------------------------------------------------------------------------
-## 6. Figures of merit and metrics
+## 7. Figures of merit and metrics
 
 | metric | definition |
 |---|---|
@@ -241,9 +306,10 @@ The JSON contains all of the above plus per-iteration times. The CSV has one row
 per run.
 
 ---------------------------------------------------------------------------------
-## 7. Validation and limitations
+## 8. Validation and limitations
 
-- Try `--selftest` on both transports (fp32/fp64/bf16/fp16, AR/AG/RS/A2Av/P2P/DistMatrix).
+- Use CPU builds with the MPI shim.
+- Use `--selftest` on transports (fp32/fp64/bf16/fp16, AR/AG/RS/A2Av/P2P/DistMatrix).
 - Gradient norms should be bit-identical between `mpi` and `hier` transports.
 - Counted FLOPs must match the analytic model.
 
@@ -252,8 +318,9 @@ per run.
 - GELU 2-matrix MLP: for SwiGLU FLOP parity set `--ffn` to 1.5× the SwiGLU width.
 - Attention materializes the score matrix (no flash attention) and computes the
   full (unmasked) score GEMMs.
-- CP uses contiguous chunks (no arbitrary zig-zag load balancing).
+- CP uses contiguous chunks (no zig-zag load balancing).
 - Experts are not tensor-parallel.
-- No interleaved/virtual PP stages.
+- Interleaved pipelining is supported, but zero-bubble schedules (splitting backward into
+  input- and weight-gradient steps) are not yet.
 - Router weights are random; the gating gradient is synthetic (its cost and its
   TP all-reduce are real).

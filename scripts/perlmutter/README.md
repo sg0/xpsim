@@ -8,8 +8,9 @@ Batch kit for functional tests and CPU/GPU scalability experiments on Perlmutter
 |---|---|
 | `env.sh gpu\|cpu` | modules (PrgEnv-gnu, cray-libsci, cudatoolkit, craype-accel-nvidia80), `MPICH_GPU_SUPPORT_ENABLED=1`, `MPICH_OFI_NIC_POLICY=GPU`, output dir (`$SCRATCH/xpsim-results`) |
 | `build.sh [gpu\|cpu]` | builds `bin/xpsim-gpu` (CUDA sm_80, CUDA-aware Cray MPICH, VMM) and `bin/xpsim-cpu` (LibSci CBLAS + OpenMP) with the `CC` wrapper |
-| `tests_gpu.sbatch`, `tests_cpu.sbatch` | functional matrix (port of `scripts/run_tests.sh`): 53 cases, every parallelism and mix, both transports, real inter-node DP/FSDP/EP cases, in-process replay (CUDA graphs on GPU) and trace save -> reload round trips on both transports with grad-norm comparison; 4 nodes, debug QOS |
-| `scaling_gpu.sbatch`, `scaling_cpu.sbatch` | weak and strong scaling over 1, 2, 4, ... nodes inside one allocation, both transports, MoE router-locality sweep at the largest scale |
+| `tests_gpu.sbatch`, `tests_cpu.sbatch` | functional matrix (port of `scripts/run_tests.sh`): 60 cases, every parallelism and mix, both transports, real inter-node DP/FSDP/EP cases, interleaved pipelines (incl. a merged multi-node timeline), in-process replay (CUDA graphs on GPU) and trace save -> reload round trips (incl. interleaved) on both transports with grad-norm comparison; 4 nodes, debug QOS |
+| `scaling_gpu.sbatch`, `scaling_cpu.sbatch` | weak and strong scaling over 1, 2, 4, ... nodes inside one allocation, both transports, MoE router-locality sweep at the largest scale; pipeline strategies `pp`, `pp_v2`, `pp_v4` (one stage per node, interleaved v=2/4) |
+| `pp_bubble_gpu.sbatch`, `pp_bubble_cpu.sbatch`, `pp_bubble_cases.sh`, `pp_bubble_summary.py` | pipeline-bubble study at a fixed node count (one stage per node): sweeps interleaving `v`, microbatches `m`, schedule (and optionally CUDA-graph replay); one timeline per case; table of measured vs theoretical bubble, MFU, memory and speedup over v=1 |
 | `common.sh`, `tests_cases.sh`, `scaling_cases.sh` | launch logic and case tables (shared by CPU and GPU) |
 | `bind.sh` | per-rank GPU affinity (local rank i -> GPU 3-i when 4 ranks/node, `--gpu-bind=none`) |
 | `summarize.py` | efficiency tables + transport comparison from the CSV; also writes `*_summary.csv` |
@@ -52,15 +53,32 @@ summary at any time with `python3 scripts/perlmutter/summarize.py <csv>`.
 | `XP_ITERS`, `XP_WARMUP` | 8, 2 / 5, 1 | measured / warm-up iterations |
 | `XP_PEAK`, `XP_TF32` | A100 dense peak (312 bf16/fp16, 19.5 fp64/fp32, 156 TF32) / measured | MFU denominator per worker |
 | `XP_REPLAY` | `off` | e.g. `"off graph"`: also run every case with in-process CUDA-graph replay (labels `mpi+graph`, `hier+graph`); the summary compares all variants |
+| `XP_PP_LAYERS`, `XP_PP_MB` | 32 / 16, 8 | depth and minimum microbatches of the `pp*` strategies |
 | `XP_DRYRUN=1` | | print the srun lines only |
 
 Efficiency definitions: weak = tokens/s per worker relative to the smallest run;
 strong = speedup / worker ratio. For 80 GB A100 nodes add `-C "gpu&hbm80g"`.
 
+## Pipeline-bubble study
+
+```bash
+sbatch -A m1234_g -N 4 scripts/perlmutter/pp_bubble_gpu.sbatch                       # p = 4 stages
+XP_REPLAY="off graph" sbatch -A m1234_g -N 8 scripts/perlmutter/pp_bubble_gpu.sbatch  # + CUDA-graph replay
+```
+Knobs:
+- `XP_PP_V` (default `1 2 4`): interleaving degrees;
+- `XP_PP_M` (`1 2 4 8`): microbatches as multiples of p;
+- `XP_PP_SCHED` (`1f1b gpipe`);
+- `XP_REPLAY`, `XP_TRANSPORTS`, `XP_PP_MODEL`, `XP_PP_LAYERS`.
+
+Output: `pp_bubble_<gpu|cpu>.csv`, the summary table (measured pp wait vs (p−1)/(v·m+p−1),
+MFU, memory, speedup over v=1) and `timelines/ppstudy_<v>_<m>_<sched>_<transport>.json`
+for `scripts/timeline_gantt.py`.
+
 ## Notes and caveats
 
 - **Tested:** the scripts were exercised end to end with a fake `srun` mapped onto the
-  thread-based MPI shim: all 53 functional cases, the 44-case scaling run, the CSV and the
+  thread-based MPI shim: all 60 functional cases, the 44-case scaling run, the CSV and the
   summary. They have not been run under real Slurm on Perlmutter.
 - **GPU build:** the CUDA backend and VMM transport have not been compiled yet. Submit
   `tests_gpu.sbatch` first; its two selftest cases check every collective on both transports.
