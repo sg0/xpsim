@@ -241,24 +241,18 @@ The JSON contains all of the above plus per-iteration times. The CSV has one row
 per run.
 
 ---------------------------------------------------------------------------------
-## 7. Validation done, and limitations
+## 7. Validation and limitations
 
-Done in the build environment (no MPI, no GPU there): CPU builds with the MPI shim.
-- `--selftest` passes on both transports (1–3 nodes, fp32/fp64/bf16/fp16, AR/AG/RS/A2Av/P2P/DistMatrix).
-- All 42 cases in `scripts/run_tests.sh` pass: 35 configurations plus 7 trace round trips.
-  In each round trip, in-process replay and replay from saved files in a fresh process give
-  bit-identical gradient norms, counted FLOPs and communication volume; a trace recorded
-  on `mpi` also replays on `hier`.
-- ThreadSanitizer is clean on the hierarchical engine.
-- Gradient norms are bit-identical between `mpi` and `hier` transports.
-- Counted FLOPs equal the analytic model.
+- Try `--selftest` on both transports (fp32/fp64/bf16/fp16, AR/AG/RS/A2Av/P2P/DistMatrix).
+- Gradient norms should be bit-identical between `mpi` and `hier` transports.
+- Counted FLOPs must match the analytic model.
 
 **Modelling simplifications:**
 - No LayerNorm/bias/dropout.
 - GELU 2-matrix MLP: for SwiGLU FLOP parity set `--ffn` to 1.5× the SwiGLU width.
 - Attention materializes the score matrix (no flash attention) and computes the
   full (unmasked) score GEMMs.
-- CP uses contiguous chunks (no zig-zag load balancing).
+- CP uses contiguous chunks (no arbitrary zig-zag load balancing).
 - Experts are not tensor-parallel.
 - No interleaved/virtual PP stages.
 - Router weights are random; the gating gradient is synthetic (its cost and its
