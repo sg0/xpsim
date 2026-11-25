@@ -60,7 +60,7 @@ ifeq ($(BLAS),libsci)
 endif
 
 SRCS := src/main.cpp src/config.cpp src/device.cpp src/device_cpu.cpp src/metrics.cpp src/comm.cpp \
-        src/comm_hier.cpp src/grid.cpp src/moe_router.cpp src/trainer.cpp src/report.cpp src/selftest.cpp src/trace.cpp
+        src/comm_hier.cpp src/grid.cpp src/moe_router.cpp src/trainer.cpp src/report.cpp src/selftest.cpp src/trace.cpp src/timeline.cpp
 ifeq ($(SHIM),1)
   SRCS += tools/mpishim/mpishim.cpp
 endif
